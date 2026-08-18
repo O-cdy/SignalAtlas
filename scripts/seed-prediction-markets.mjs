@@ -1,57 +1,30 @@
 #!/usr/bin/env node
 
 import { loadEnvFile, CHROME_UA, sleep, runSeed } from './_seed-utils.mjs';
+import {
+  buildBootstrapPools,
+  predictionPoolCounts,
+  validateBootstrapPayload,
+} from './_prediction-classify.mjs';
+import {
+  isExcluded, isMemeCandidate, tagRegions, parseYesPrice, selectPricedKalshiMarket,
+  shouldInclude, scoreMarket, isExpired,
+} from './_prediction-scoring.mjs';
+import predictionTags from './data/prediction-tags.json' with { type: 'json' };
 
 loadEnvFile(import.meta.url);
 
 const CANONICAL_KEY = 'prediction:markets-bootstrap:v1';
-const CACHE_TTL = 900; // 15 min — matches client poll interval
+const CACHE_TTL = 10800; // 3h — 6x the 30 min cron interval (gold standard: survive 5 missed runs)
 
 const GAMMA_BASE = 'https://gamma-api.polymarket.com';
+const KALSHI_BASE = 'https://api.elections.kalshi.com/trade-api/v2';
 const FETCH_TIMEOUT = 10_000;
 const TAG_DELAY_MS = 300;
 
-const GEOPOLITICAL_TAGS = [
-  'politics', 'geopolitics', 'elections', 'world',
-  'ukraine', 'china', 'middle-east', 'europe',
-  'economy', 'fed', 'inflation',
-];
-
-const TECH_TAGS = [
-  'ai', 'tech', 'crypto', 'science',
-  'elon-musk', 'business', 'economy',
-];
-
-const EXCLUDE_KEYWORDS = [
-  'nba', 'nfl', 'mlb', 'nhl', 'fifa', 'world cup', 'super bowl', 'championship',
-  'playoffs', 'oscar', 'grammy', 'emmy', 'box office', 'movie', 'album', 'song',
-  'streamer', 'influencer', 'celebrity', 'kardashian',
-  'bachelor', 'reality tv', 'mvp', 'touchdown', 'home run', 'goal scorer',
-  'academy award', 'bafta', 'golden globe', 'cannes', 'sundance',
-  'documentary', 'feature film', 'tv series', 'season finale',
-];
-
-function isExcluded(title) {
-  const lower = title.toLowerCase();
-  return EXCLUDE_KEYWORDS.some(kw => lower.includes(kw));
-}
-
-function parseYesPrice(market) {
-  try {
-    const prices = JSON.parse(market.outcomePrices || '[]');
-    if (prices.length >= 1) {
-      const p = parseFloat(prices[0]);
-      if (!isNaN(p)) return +(p * 100).toFixed(1);
-    }
-  } catch {}
-  return 50;
-}
-
-function isExpired(endDate) {
-  if (!endDate) return false;
-  const ms = Date.parse(endDate);
-  return Number.isFinite(ms) && ms < Date.now();
-}
+const GEOPOLITICAL_TAGS = predictionTags.geopolitical;
+const TECH_TAGS = predictionTags.tech;
+const FINANCE_TAGS = predictionTags.finance;
 
 async function fetchEventsByTag(tag, limit = 20) {
   const params = new URLSearchParams({
@@ -77,10 +50,81 @@ async function fetchEventsByTag(tag, limit = 20) {
   return Array.isArray(data) ? data : [];
 }
 
+async function fetchKalshiEvents() {
+  try {
+    const params = new URLSearchParams({
+      status: 'open',
+      with_nested_markets: 'true',
+      limit: '100',
+    });
+    const headers = { Accept: 'application/json', 'User-Agent': CHROME_UA };
+    const resp = await fetch(`${KALSHI_BASE}/events?${params}`, {
+      headers,
+      signal: AbortSignal.timeout(FETCH_TIMEOUT),
+    });
+    if (!resp.ok) {
+      console.warn(`  [kalshi] HTTP ${resp.status}`);
+      return [];
+    }
+    const data = await resp.json();
+    return Array.isArray(data?.events) ? data.events : [];
+  } catch (err) {
+    console.warn(`  [kalshi] error fetching events: ${err.message}`);
+    return [];
+  }
+}
+
+function kalshiTitle(marketTitle, eventTitle) {
+  if (!marketTitle) return eventTitle || '';
+  if (marketTitle.includes('?') || marketTitle.length > 60) return marketTitle;
+  if (!eventTitle || marketTitle === eventTitle) return marketTitle;
+  return `${eventTitle}: ${marketTitle}`;
+}
+
+async function fetchKalshiMarkets() {
+  const events = await fetchKalshiEvents();
+  const results = [];
+
+  for (const event of events) {
+    if (!Array.isArray(event.markets) || event.markets.length === 0) continue;
+    if (isExcluded(event.title)) continue;
+
+    const binaryActive = event.markets.filter(
+      m => m.market_type === 'binary' && m.status === 'active',
+    );
+    if (binaryActive.length === 0) continue;
+
+    const selected = selectPricedKalshiMarket(binaryActive);
+    if (!selected) continue;
+    const { market: topMarket, yesPrice } = selected;
+
+    const volume = parseFloat(topMarket.volume_fp) || 0;
+    if (volume <= 5000) continue;
+
+    const marketTitle = topMarket.yes_sub_title || topMarket.title || '';
+    const title = kalshiTitle(marketTitle, event.title);
+
+    results.push({
+      title,
+      yesPrice,
+      volume,
+      url: `https://kalshi.com/markets/${topMarket.ticker}`,
+      endDate: topMarket.close_time ?? undefined,
+      tags: [],
+      source: 'kalshi',
+    });
+  }
+
+  return results;
+}
+
 async function fetchAllPredictions() {
-  const allTags = [...new Set([...GEOPOLITICAL_TAGS, ...TECH_TAGS])];
+  const allTags = [...new Set([...GEOPOLITICAL_TAGS, ...TECH_TAGS, ...FINANCE_TAGS])];
   const seen = new Set();
   const markets = [];
+
+  // Start Kalshi fetch early so it overlaps with Polymarket tag iterations
+  const kalshiPromise = fetchKalshiMarkets();
 
   for (const tag of allTags) {
     try {
@@ -105,22 +149,17 @@ async function fetchAllPredictions() {
             return vol > bestVol ? m : best;
           });
 
+          const yesPrice = parseYesPrice(topMarket);
+          if (yesPrice === null) continue;
+
           markets.push({
             title: topMarket.question || event.title,
-            yesPrice: parseYesPrice(topMarket),
+            yesPrice,
             volume: eventVolume,
             url: `https://polymarket.com/event/${event.slug}`,
             endDate: topMarket.endDate ?? event.endDate ?? undefined,
             tags: (event.tags ?? []).map(t => t.slug),
-          });
-        } else {
-          markets.push({
-            title: event.title,
-            yesPrice: 50,
-            volume: eventVolume,
-            url: `https://polymarket.com/event/${event.slug}`,
-            endDate: event.endDate ?? undefined,
-            tags: (event.tags ?? []).map(t => t.slug),
+            source: 'polymarket',
           });
         }
       }
@@ -130,34 +169,56 @@ async function fetchAllPredictions() {
     await sleep(TAG_DELAY_MS);
   }
 
-  const geopolitical = markets
-    .filter(m => !isExpired(m.endDate))
-    .filter(m => {
-      const discrepancy = Math.abs(m.yesPrice - 50);
-      return discrepancy > 5 || (m.volume > 50000);
-    })
-    .sort((a, b) => b.volume - a.volume)
-    .slice(0, 25);
+  // Await the Kalshi fetch that was started in parallel with tag iterations
+  const kalshiMarkets = await kalshiPromise;
+  console.log(`  [kalshi] ${kalshiMarkets.length} markets`);
+  markets.push(...kalshiMarkets);
 
-  const tech = markets
-    .filter(m => !isExpired(m.endDate))
-    .filter(m => m.tags?.some(t => TECH_TAGS.includes(t)))
-    .filter(m => {
-      const discrepancy = Math.abs(m.yesPrice - 50);
-      return discrepancy > 5 || (m.volume > 50000);
-    })
-    .sort((a, b) => b.volume - a.volume)
-    .slice(0, 25);
+  console.log(`  total raw markets: ${markets.length}`);
+
+  // #5733: assign each market ONE primary category, then rank WITHIN that pool.
+  // The pools used to be three independent filters over `markets` — with
+  // `geopolitical` taking no filter at all, so it was a copy of everything, and
+  // tech/finance overlapping on the economy/crypto/business tags. Partitioning
+  // first is what makes the published labels mean something and stops the same
+  // record being published three times. The whole pool-building path lives in
+  // _prediction-classify.mjs so the tests exercise THIS wiring, not a replica of
+  // it (this module can never be imported by a test — runSeed runs at import).
+  const { pools, classified, duplicatesDropped } = buildBootstrapPools(markets);
+
+  if (duplicatesDropped > 0) {
+    console.log(`  deduped ${duplicatesDropped} same-identity record(s) before classification`);
+  }
+  console.log(
+    `  classified: geopolitical ${classified.geopolitical}, tech ${classified.tech}, finance ${classified.finance}`
+    + ` → published: ${pools.geopolitical.length}/${pools.tech.length}/${pools.finance.length}`,
+  );
 
   return {
-    geopolitical,
-    tech,
+    ...pools,
     fetchedAt: Date.now(),
   };
+}
+
+export function declareRecords(data) {
+  return (data?.geopolitical?.length || 0) + (data?.tech?.length || 0) + (data?.finance?.length || 0);
 }
 
 await runSeed('prediction', 'markets', CANONICAL_KEY, fetchAllPredictions, {
   ttlSeconds: CACHE_TTL,
   lockTtlMs: 60_000,
-  validateFn: (data) => (data?.geopolitical?.length > 0 || data?.tech?.length > 0),
+  // Population requirement + #5733 category-integrity gate. Lives in
+  // _prediction-classify.mjs so the gate is unit-testable (this module runs
+  // runSeed at import time, so a test can never import it).
+  validateFn: validateBootstrapPayload,
+
+  declareRecords,
+  afterPublish: (data) => ({
+    freshnessMetaPatch: {
+      poolCounts: predictionPoolCounts(data),
+    },
+  }),
+  schemaVersion: 1,
+  maxStaleMin: 90,
+  sourceVersion: 'prediction-markets-v1',
 });

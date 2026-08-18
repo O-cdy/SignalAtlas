@@ -1,20 +1,14 @@
-/**
- * Reverse geocoding using Nominatim (OpenStreetMap) - free, no API key
- * Converts lat/lon to country name + ISO code
- */
+import { toApiUrl } from '@/services/runtime';
 
 export interface GeoResult {
   country: string;
-  code: string; // ISO 3166-1 alpha-2 (e.g. "IR", "US")
+  code: string;
   displayName: string;
 }
 
 const cache = new Map<string, GeoResult | null>();
-let lastRequestTime = 0;
-const MIN_INTERVAL_MS = 1100; // Nominatim: max 1 req/sec
 
 function cacheKey(lat: number, lon: number): string {
-  // Round to ~11km grid to avoid duplicate calls for nearby clicks
   return `${lat.toFixed(1)},${lon.toFixed(1)}`;
 }
 
@@ -24,47 +18,38 @@ export async function reverseGeocode(lat: number, lon: number, signal?: AbortSig
   const key = cacheKey(lat, lon);
   if (cache.has(key)) return cache.get(key) ?? null;
 
-  // Throttle
-  const now = Date.now();
-  const wait = MIN_INTERVAL_MS - (now - lastRequestTime);
-  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-  lastRequestTime = Date.now();
-
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
   const onExternalAbort = () => controller.abort();
   signal?.addEventListener('abort', onExternalAbort, { once: true });
 
   try {
-    const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&zoom=3&accept-language=en`;
-    const res = await fetch(url, {
-      headers: { 'User-Agent': 'WorldMonitor/2.0 (https://worldmonitor.app)' },
+    const res = await fetch(toApiUrl(`/api/reverse-geocode?lat=${lat}&lon=${lon}`), {
       signal: controller.signal,
     });
     if (!res.ok) {
-      cache.set(key, null);
+      // Never memoize a retryable status. `cache` has no TTL and is consulted
+      // before every fetch, so caching a 429 (the route is rate-limited since
+      // #6234) or a 503 would mark this 0.1-degree cell "no country here" for
+      // the rest of the page session — a transient throttle turned permanent.
+      // Genuine negative results still cache exactly as before. (#6412 review)
+      if (res.status !== 429 && res.status !== 503) cache.set(key, null);
       return null;
     }
 
     const data = await res.json();
-    const country = data.address?.country;
-    const code = data.address?.country_code?.toUpperCase();
-
-    if (!country || !code) {
+    if (!data.country || !data.code) {
       cache.set(key, null);
       return null;
     }
 
-    const result: GeoResult = { country, code, displayName: data.display_name || country };
+    const result: GeoResult = { country: data.country, code: data.code, displayName: data.displayName || data.country };
     cache.set(key, result);
     return result;
-  } catch (err) {
-    // Don't cache abort/timeout errors — the request may succeed on retry
-    if (controller.signal.aborted) {
-      return null;
+  } catch {
+    if (!controller.signal.aborted) {
+      cache.set(key, null);
     }
-    console.warn('[reverseGeocode] Failed:', err);
-    cache.set(key, null);
     return null;
   } finally {
     clearTimeout(timeout);

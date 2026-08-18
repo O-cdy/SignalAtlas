@@ -13,8 +13,10 @@ import {
 } from '@/components/LiveNewsPanel';
 import { t } from '@/services/i18n';
 import { escapeHtml } from '@/utils/sanitize';
-import { isDesktopRuntime, getRemoteApiBaseUrl } from '@/services/runtime';
+import { toApiUrl } from '@/services/runtime';
 import { resolveUserCountryCode } from '@/utils/user-location';
+import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
+
 
 /** Builds a stable custom channel id from a YouTube handle (e.g. @Foo -> custom-foo). */
 function customChannelIdFromHandle(handle: string): string {
@@ -168,7 +170,7 @@ export async function initLiveChannelsWindow(containerEl?: HTMLElement): Promise
   }
 
   function renderList(listEl: HTMLElement): void {
-    listEl.innerHTML = '';
+    setTrustedHtml(listEl, trustedHtml('', "legacy direct innerHTML migration"));
     for (const ch of channels) {
       const isCustom = !BUILTIN_IDS.has(ch.id);
       const row = document.createElement('div');
@@ -250,7 +252,7 @@ export async function initLiveChannelsWindow(containerEl?: HTMLElement): Promise
 
   function showEditForm(row: HTMLElement, ch: LiveChannel, listEl: HTMLElement): void {
     const isCustom = !BUILTIN_IDS.has(ch.id);
-    row.innerHTML = '';
+    setTrustedHtml(row, trustedHtml('', "legacy direct innerHTML migration"));
     row.className = 'live-news-manage-row live-news-manage-row-editing';
 
     if (isCustom) {
@@ -315,8 +317,28 @@ export async function initLiveChannelsWindow(containerEl?: HTMLElement): Promise
     const currentIds = new Set(channels.map((c) => c.id));
     const term = searchQuery.toLowerCase().trim();
 
+    // Auto-switch to the first tab with matches when searching
+    if (term) {
+      const activeHasMatch = filteredRegions.some(r => {
+        if (r.key !== activeRegionTab) return false;
+        return r.channelIds.some(id => {
+          const ch = optionalChannelMap.get(id);
+          return ch && (ch.name.toLowerCase().includes(term) || ch.handle?.toLowerCase().includes(term));
+        });
+      });
+      if (!activeHasMatch) {
+        const firstMatch = filteredRegions.find(r =>
+          r.channelIds.some(id => {
+            const ch = optionalChannelMap.get(id);
+            return ch && (ch.name.toLowerCase().includes(term) || ch.handle?.toLowerCase().includes(term));
+          }),
+        );
+        if (firstMatch) activeRegionTab = firstMatch.key;
+      }
+    }
+
     // Render tab buttons
-    tabBar.innerHTML = '';
+    setTrustedHtml(tabBar, trustedHtml('', "legacy direct innerHTML migration"));
     for (const region of filteredRegions) {
       const regionChannels = region.channelIds
         .map(id => optionalChannelMap.get(id))
@@ -330,7 +352,7 @@ export async function initLiveChannelsWindow(containerEl?: HTMLElement): Promise
 
       const btn = document.createElement('button');
       btn.type = 'button';
-      btn.className = 'live-news-manage-tab-btn' + (region.key === activeRegionTab ? ' active' : '');
+      btn.className = 'panel-tab' + (region.key === activeRegionTab ? ' active' : '');
       const label = t(region.labelKey) ?? region.key.toUpperCase();
       btn.textContent = term
         ? `${label} (${matchingChannels.length})`
@@ -343,7 +365,7 @@ export async function initLiveChannelsWindow(containerEl?: HTMLElement): Promise
     }
 
     // Render tab content panels
-    tabContents.innerHTML = '';
+    setTrustedHtml(tabContents, trustedHtml('', "legacy direct innerHTML migration"));
     for (const region of filteredRegions) {
       const panel = document.createElement('div');
       panel.className = 'live-news-manage-tab-content' + (region.key === activeRegionTab ? ' active' : '');
@@ -416,13 +438,14 @@ export async function initLiveChannelsWindow(containerEl?: HTMLElement): Promise
       }
       saveChannelsToStorage(channels);
       renderList(listEl);
+      renderAvailableChannels(listEl);
     });
     return card;
   }
 
   // ── Render shell ──
 
-  appEl.innerHTML = `
+  setTrustedHtml(appEl, trustedHtml(`
     <div class="live-channels-window-shell">
       <div class="live-channels-window-header">
         <span class="live-channels-window-title">${escapeHtml(t('components.liveNews.manage') ?? 'Channel management')}</span>
@@ -439,10 +462,10 @@ export async function initLiveChannelsWindow(containerEl?: HTMLElement): Promise
               <span class="live-news-manage-search-icon">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
               </span>
-              <input type="text" id="liveChannelsSearch" class="live-news-manage-search-input" placeholder="${escapeHtml(t('header.search') ?? 'Search')}..." autocomplete="off" />
+              <input type="text" id="liveChannelsSearch" class="live-news-manage-search-input" placeholder="${escapeHtml(t('header.search') ?? 'Search')}..." aria-label="${escapeHtml(t('header.search') ?? 'Search')}" autocomplete="off" />
             </div>
           </div>
-          <div class="live-news-manage-tab-bar" id="liveChannelsTabBar"></div>
+          <div class="panel-tabs" id="liveChannelsTabBar"></div>
           <div class="live-news-manage-tab-contents" id="liveChannelsTabContents"></div>
         </div>
         <div class="live-news-manage-add-section">
@@ -465,7 +488,7 @@ export async function initLiveChannelsWindow(containerEl?: HTMLElement): Promise
         </div>
       </div>
     </div>
-  `;
+  `, "legacy direct innerHTML migration"));
 
   const listEl = document.getElementById('liveChannelsList');
   if (!listEl) return;
@@ -545,8 +568,7 @@ export async function initLiveChannelsWindow(containerEl?: HTMLElement): Promise
       let resolvedName = nameInput?.value?.trim() || '';
       if (!resolvedName) {
         try {
-          const baseUrl = isDesktopRuntime() ? getRemoteApiBaseUrl() : '';
-          const res = await fetch(`${baseUrl}/api/youtube/live?videoId=${encodeURIComponent(videoId)}`);
+          const res = await fetch(toApiUrl(`/api/youtube/live?videoId=${encodeURIComponent(videoId)}`));
           if (res.ok) {
             const data = await res.json();
             resolvedName = data.channelName || data.title || '';
@@ -594,8 +616,7 @@ export async function initLiveChannelsWindow(containerEl?: HTMLElement): Promise
 
     let resolvedName = '';
     try {
-      const baseUrl = isDesktopRuntime() ? getRemoteApiBaseUrl() : '';
-      const res = await fetch(`${baseUrl}/api/youtube/live?channel=${encodeURIComponent(handle)}`);
+      const res = await fetch(toApiUrl(`/api/youtube/live?channel=${encodeURIComponent(handle)}`));
       if (res.ok) {
         const data = await res.json();
         resolvedName = data.channelName || '';

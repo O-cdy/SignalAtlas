@@ -7,7 +7,8 @@ import type {
   GulfInvestingEntity,
   GulfInvestmentStatus,
 } from '@/types';
-import { escapeHtml } from '@/utils/sanitize';
+import { toUniqueSorted } from '@/utils';
+import { escapeHtml, unsafeRawHtml } from '@/utils/sanitize';
 import { t } from '@/services/i18n';
 
 interface InvestmentFilters {
@@ -110,8 +111,8 @@ export class InvestmentsPanel extends Panel {
   private render(): void {
     const filtered = this.getFiltered();
 
-    const entities = Array.from(new Set(GULF_INVESTMENTS.map(i => i.investingEntity))).sort();
-    const sectors = Array.from(new Set(GULF_INVESTMENTS.map(i => i.sector))).sort();
+    const entities = toUniqueSorted(GULF_INVESTMENTS.map((i) => i.investingEntity));
+    const sectors = toUniqueSorted(GULF_INVESTMENTS.map((i) => i.sector));
 
     const sortCls = (key: keyof GulfInvestment) =>
       this.sortKey === key ? 'fdi-sort fdi-sort-active' : 'fdi-sort';
@@ -157,20 +158,20 @@ export class InvestmentsPanel extends Panel {
         <button class="${toggleCls}" data-action="toggle-filters" title="Filters" aria-label="Toggle filters" aria-pressed="${this.filtersExpanded}">⚙</button>
       </div>
       <div class="${filtersCls}">
-        <select class="fdi-filter" data-filter="investingCountry">
+        <select class="fdi-filter" data-filter="investingCountry" aria-label="Filter by investing country">
           <option value="ALL">🌐 ${t('components.investments.allCountries')}</option>
           <option value="SA"${this.filters.investingCountry === 'SA' ? ' selected' : ''}>🇸🇦 ${t('components.investments.saudiArabia')}</option>
           <option value="UAE"${this.filters.investingCountry === 'UAE' ? ' selected' : ''}>🇦🇪 ${t('components.investments.uae')}</option>
         </select>
-        <select class="fdi-filter" data-filter="sector">
+        <select class="fdi-filter" data-filter="sector" aria-label="Filter by sector">
           <option value="ALL">${t('components.investments.allSectors')}</option>
           ${sectors.map(s => `<option value="${s}"${this.filters.sector === s ? ' selected' : ''}>${escapeHtml(getSectorLabel(s as GulfInvestmentSector))}</option>`).join('')}
         </select>
-        <select class="fdi-filter" data-filter="entity">
+        <select class="fdi-filter" data-filter="entity" aria-label="Filter by entity">
           <option value="ALL">${t('components.investments.allEntities')}</option>
           ${entities.map(e => `<option value="${escapeHtml(e)}"${this.filters.entity === e ? ' selected' : ''}>${escapeHtml(e)}</option>`).join('')}
         </select>
-        <select class="fdi-filter" data-filter="status">
+        <select class="fdi-filter" data-filter="status" aria-label="Filter by status">
           <option value="ALL">${t('components.investments.allStatuses')}</option>
           <option value="operational"${sel('operational')}>${t('components.investments.operational')}</option>
           <option value="under-construction"${sel('under-construction')}>${t('components.investments.underConstruction')}</option>
@@ -189,7 +190,7 @@ export class InvestmentsPanel extends Panel {
         ${rows || `<div class="fdi-empty">${t('components.investments.noMatch')}</div>`}
       </div>`;
 
-    this.setContent(html);
+    this.setSafeContent(unsafeRawHtml(html, 'legacy Panel.setContent() migration'));
     if (this.countEl) this.countEl.textContent = String(filtered.length);
   }
 

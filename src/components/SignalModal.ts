@@ -1,10 +1,24 @@
+import type { SignalArticle } from '@/services/analysis-core';
 import type { CorrelationSignal } from '@/services/correlation';
 import type { UnifiedAlert } from '@/services/cross-module-integration';
-import { suppressTrendingTerm } from '@/services/trending-keywords';
-import { escapeHtml } from '@/utils/sanitize';
+import { escapeHtml, sanitizeUrl } from '@/utils/sanitize';
 import { getCSSColor } from '@/utils';
 import { getSignalContext, type SignalType } from '@/utils/analysis-constants';
 import { t } from '@/services/i18n';
+import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
+
+// Render-side display ceiling for a keyword spike's evidence list. Independent
+// of the emitter's own cap (MAX_SPIKE_ARTICLES) and deliberately higher, so it
+// bounds an untrusted producer without ever truncating what handleSpike emits.
+const MAX_RENDERED_EVIDENCE_ITEMS = 12;
+
+function suppressTrendingTermLazy(term: string): void {
+  void import('@/services/trending-keywords')
+    .then(module => module.suppressTrendingTerm(term))
+    .catch((err) => {
+      console.warn('[SignalModal] suppressTrendingTerm failed (chunk load?):', err);
+    });
+}
 
 export class SignalModal {
   private element: HTMLElement;
@@ -17,7 +31,9 @@ export class SignalModal {
   constructor() {
     this.element = document.createElement('div');
     this.element.className = 'signal-modal-overlay';
-    this.element.innerHTML = `
+    this.element.setAttribute('role', 'dialog');
+    this.element.setAttribute('aria-modal', 'true');
+    setTrustedHtml(this.element, trustedHtml(`
       <div class="signal-modal">
         <div class="signal-modal-header">
           <span class="signal-modal-title">🎯 ${t('modals.signal.title')}</span>
@@ -32,7 +48,7 @@ export class SignalModal {
           <button class="signal-dismiss-btn">${t('modals.signal.dismiss')}</button>
         </div>
       </div>
-    `;
+    `, "legacy direct innerHTML migration"));
 
     document.body.appendChild(this.element);
     this.setupEventListeners();
@@ -76,7 +92,7 @@ export class SignalModal {
       if (target.classList.contains('location-link')) {
         const lat = parseFloat(target.dataset.lat || '0');
         const lon = parseFloat(target.dataset.lon || '0');
-        if (this.onLocationClick && !isNaN(lat) && !isNaN(lon)) {
+        if (this.onLocationClick && !Number.isNaN(lat) && !Number.isNaN(lon)) {
           this.onLocationClick(lat, lon);
           this.hide();
         }
@@ -86,7 +102,7 @@ export class SignalModal {
       if (target.classList.contains('suppress-keyword-btn')) {
         const term = (target.dataset.term || '').trim();
         if (!term) return;
-        suppressTrendingTerm(term);
+        suppressTrendingTermLazy(term);
         this.currentSignals = this.currentSignals.filter(signal => {
           const signalTerm = (signal.data as Record<string, unknown>).term;
           return typeof signalTerm !== 'string' || signalTerm.toLowerCase() !== term.toLowerCase();
@@ -135,6 +151,8 @@ export class SignalModal {
       cii_spike: '📊',
       convergence: '🌍',
       cascade: '⚡',
+      sanctions: '🚫',
+      radiation: '☢️',
       composite: '🔗',
     };
 
@@ -205,7 +223,68 @@ export class SignalModal {
       `;
     }
 
-    content.innerHTML = `
+
+    if (alert.components.sanctions) {
+      const sanctions = alert.components.sanctions;
+      detailsHtml += `
+        <div class="signal-context-item">
+          <span class="context-label">Country</span>
+          <span class="context-value">${escapeHtml(sanctions.countryName)} (${escapeHtml(sanctions.countryCode)})</span>
+        </div>
+        <div class="signal-context-item">
+          <span class="context-label">Pressure</span>
+          <span class="context-value">${sanctions.entryCount} designations${sanctions.newEntryCount > 0 ? ` · +${sanctions.newEntryCount} new` : ''}</span>
+        </div>
+        <div class="signal-context-item">
+          <span class="context-label">Top program</span>
+          <span class="context-value">${escapeHtml(sanctions.topProgram)} (${sanctions.topProgramCount})</span>
+        </div>
+        <div class="signal-context-item">
+          <span class="context-label">Vessels / aircraft</span>
+          <span class="context-value">${sanctions.vesselCount} / ${sanctions.aircraftCount}</span>
+        </div>
+        <div class="signal-context-item">
+          <span class="context-label">Dataset size</span>
+          <span class="context-value">${sanctions.totalCount}${sanctions.datasetDate ? ` · ${new Date(sanctions.datasetDate).toISOString().slice(0, 10)}` : ''}</span>
+        </div>
+      `;
+    }
+
+    if (alert.components.radiation) {
+      const radiation = alert.components.radiation;
+      detailsHtml += `
+        <div class="signal-context-item">
+          <span class="context-label">Station</span>
+          <span class="context-value">${escapeHtml(radiation.siteName)}</span>
+        </div>
+        <div class="signal-context-item">
+          <span class="context-label">Reading</span>
+          <span class="context-value">${radiation.value.toFixed(1)} ${escapeHtml(radiation.unit)}</span>
+        </div>
+        <div class="signal-context-item">
+          <span class="context-label">Baseline</span>
+          <span class="context-value">${radiation.baselineValue.toFixed(1)} ${escapeHtml(radiation.unit)}</span>
+        </div>
+        <div class="signal-context-item">
+          <span class="context-label">Delta / z-score</span>
+          <span class="context-value">+${radiation.delta.toFixed(1)} / ${radiation.zScore.toFixed(2)}</span>
+        </div>
+        <div class="signal-context-item">
+          <span class="context-label">Confidence</span>
+          <span class="context-value">${escapeHtml(radiation.confidence)}${radiation.corroborated ? ' · confirmed' : ''}${radiation.conflictingSources ? ' · conflicting' : ''}</span>
+        </div>
+        <div class="signal-context-item">
+          <span class="context-label">Sources</span>
+          <span class="context-value">${escapeHtml(radiation.contributingSources.join(' + '))} (${radiation.sourceCount})</span>
+        </div>
+        <div class="signal-context-item">
+          <span class="context-label">Anomalies in batch</span>
+          <span class="context-value">${radiation.anomalyCount} total (${radiation.spikeCount} spike, ${radiation.elevatedCount} elevated, ${radiation.corroboratedCount} confirmed)</span>
+        </div>
+      `;
+    }
+
+    setTrustedHtml(content, trustedHtml(`
       <div class="signal-item" style="border-left-color: ${color}">
         <div class="signal-type">${icon} ${alert.type.toUpperCase().replace('_', ' ')}</div>
         <div class="signal-title">${escapeHtml(alert.title)}</div>
@@ -223,7 +302,7 @@ export class SignalModal {
           </div>
         ` : ''}
       </div>
-    `;
+    `, "legacy direct innerHTML migration"));
 
     this.element.classList.add('active');
     this.activateEsc();
@@ -318,6 +397,7 @@ export class SignalModal {
               ${signal.data.relatedTopics.map(t => `<span class="signal-topic">${escapeHtml(t)}</span>`).join('')}
             </div>
           ` : ''}
+          ${this.renderSpikeEvidence(signal)}
           ${signal.type === 'keyword_spike' && typeof data?.term === 'string' ? `
             <div class="signal-actions">
               <button class="suppress-keyword-btn" data-term="${escapeHtml(data.term)}">${t('modals.signal.suppress')}</button>
@@ -327,7 +407,83 @@ export class SignalModal {
       `;
     }).join('');
 
-    content.innerHTML = html;
+    setTrustedHtml(content, trustedHtml(html, "legacy direct innerHTML migration"));
+  }
+
+  /**
+   * A keyword spike reports "N mentions across M sources"; until #6414 the
+   * sources and articles behind that count were dropped at the emit site, so
+   * the only thing a user could do with the alert was silence it. The payload
+   * now carries them — render them so the alert is reachable from the news it
+   * is about.
+   *
+   * Shape is validated rather than trusted: `signal.data` is a loose bag that
+   * already carries undeclared fields (`newsCorrelation`, `focalPointContext`,
+   * `lat`/`lon`), and signals reach this modal from several producers — the
+   * main-thread correlation engine, the analysis worker, and the unified-alert
+   * adapter — so the render boundary cannot assume the declared type.
+   */
+  private renderSpikeEvidence(signal: CorrelationSignal): string {
+    if (signal.type !== 'keyword_spike') return '';
+
+    const data = signal.data as { sourceNames?: unknown; articles?: unknown };
+
+    const sourceNames = Array.isArray(data.sourceNames)
+      ? data.sourceNames.filter(
+          (name): name is string => typeof name === 'string' && name.trim().length > 0,
+        )
+      : [];
+
+    const articles = Array.isArray(data.articles)
+      ? (data.articles as SignalArticle[]).filter(
+          article => !!article && typeof article.title === 'string' && article.title.length > 0,
+        )
+      : [];
+
+    if (sourceNames.length === 0 && articles.length === 0) return '';
+
+    // A display ceiling, deliberately set ABOVE the emitter's MAX_SPIKE_ARTICLES
+    // so it never truncates a legitimate payload — it exists only so a producer
+    // this boundary does not trust cannot make the modal render an arbitrarily
+    // long list. A term trending across dozens of feeds is normal, so the chips
+    // overflow into a "+N" counter rather than being silently dropped.
+    const shownSources = sourceNames.slice(0, MAX_RENDERED_EVIDENCE_ITEMS);
+    const hiddenSourceCount = sourceNames.length - shownSources.length;
+
+    // Deliberately reusing `header.sources` and `popups.relatedHeadlines`:
+    // both already carry vetted translations in every locale, and nothing in
+    // CI backfills a brand-new key, so a fresh `modals.signal.*` pair would
+    // ship as English to every non-English user. `header.sources` is already
+    // mirrored in en.shell.json, so this costs no first-paint shell budget.
+    const sourcesBlock = sourceNames.length ? `
+      <div class="signal-sources">
+        <span class="signal-sources-label">${t('header.sources')}</span>
+        ${shownSources.map(name => `<span class="signal-source-chip">${escapeHtml(name)}</span>`).join('')}
+        ${hiddenSourceCount > 0 ? `<span class="signal-source-chip signal-source-chip-more">+${hiddenSourceCount}</span>` : ''}
+      </div>
+    ` : '';
+
+    const articlesBlock = articles.length ? `
+      <div class="signal-articles">
+        <div class="signal-articles-header">📰 ${t('popups.relatedHeadlines')}</div>
+        ${articles.slice(0, MAX_RENDERED_EVIDENCE_ITEMS).map(article => {
+          // sanitizeUrl returns '' for anything that is not http(s) — render
+          // the headline as text rather than as a link that cannot be trusted.
+          const href = typeof article.link === 'string' ? sanitizeUrl(article.link) : '';
+          const title = escapeHtml(article.title);
+          return `
+            <div class="signal-article-item">
+              <span class="news-source">${escapeHtml(article.source ?? '')}</span>
+              ${href
+                ? `<a class="news-title" href="${href}" target="_blank" rel="noopener noreferrer">${title}</a>`
+                : `<span class="news-title">${title}</span>`}
+            </div>
+          `;
+        }).join('')}
+      </div>
+    ` : '';
+
+    return `${sourcesBlock}${articlesBlock}`;
   }
 
   private formatTime(date: Date): string {

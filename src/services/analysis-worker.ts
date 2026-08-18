@@ -36,6 +36,10 @@ class AnalysisWorkerManager {
   private pendingRequests: Map<string, PendingRequest<unknown>> = new Map();
   private requestIdCounter = 0;
   private isReady = false;
+  // Set true when worker construction throws synchronously (e.g. legacy
+  // browsers without module-worker support). Latches so we don't re-attempt
+  // construction on every call, and gates callers into graceful degradation.
+  private workerUnavailable = false;
   private readyPromise: Promise<void> | null = null;
   private readyResolve: (() => void) | null = null;
   private readyReject: ((error: Error) => void) | null = null;
@@ -47,7 +51,7 @@ class AnalysisWorkerManager {
    * Initialize the worker. Called lazily on first use.
    */
   private initWorker(): void {
-    if (this.worker) return;
+    if (this.worker || this.workerUnavailable) return;
 
     this.readyPromise = new Promise((resolve, reject) => {
       this.readyResolve = resolve;
@@ -67,8 +71,17 @@ class AnalysisWorkerManager {
     try {
       this.worker = new AnalysisWorker();
     } catch (error) {
+      // Legacy browsers without module-worker support (e.g. old smart-TV
+      // browsers) throw synchronously here. Do NOT reject readyPromise:
+      // cleanup() nulls readyPromise in this same synchronous tick, so
+      // waitForReady's `await this.readyPromise` would await `null` and the
+      // rejection would be orphaned into an unhandled promise rejection
+      // (WORLDMONITOR-V2/V6). Instead latch `workerUnavailable`, resolve the
+      // ready gate, and let clusterNews/analyzeCorrelations degrade to an
+      // empty result. Mirrors ml-worker's graceful `resolve(false)` path.
       console.error('[AnalysisWorker] Failed to create worker:', error);
-      this.readyReject?.(error instanceof Error ? error : new Error(String(error)));
+      this.workerUnavailable = true;
+      this.readyResolve?.();
       this.cleanup();
       return;
     }
@@ -169,21 +182,18 @@ class AnalysisWorkerManager {
     return `req-${++this.requestIdCounter}-${Date.now()}`;
   }
 
-  /**
-   * Cluster news articles using Web Worker.
-   * Runs O(n²) Jaccard similarity off the main thread.
-   */
-  async clusterNews(items: NewsItem[]): Promise<ClusteredEvent[]> {
-    await this.waitForReady();
-
+  private request<T>(
+    type: 'cluster' | 'correlation',
+    payload: Record<string, unknown>,
+    timeoutMs: number,
+    timeoutMessage: string
+  ): Promise<T> {
     return new Promise((resolve, reject) => {
       const id = this.generateId();
-
-      // Set timeout (30 seconds - clustering can take a while for large datasets)
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(id);
-        reject(new Error('Clustering request timed out'));
-      }, 30000);
+        reject(new Error(timeoutMessage));
+      }, timeoutMs);
 
       this.pendingRequests.set(id, {
         resolve: resolve as (value: unknown) => void,
@@ -192,12 +202,29 @@ class AnalysisWorkerManager {
       });
 
       this.worker!.postMessage({
-        type: 'cluster',
+        type,
         id,
-        items,
-        sourceTiers: SOURCE_TIERS,
+        ...payload,
       });
     });
+  }
+
+  /**
+   * Cluster news articles using Web Worker.
+   * Runs O(n²) Jaccard similarity off the main thread.
+   */
+  async clusterNews(items: NewsItem[]): Promise<ClusteredEvent[]> {
+    await this.waitForReady();
+    // Worker never came up (e.g. browser lacks module-worker support) — skip
+    // clustering rather than posting to a null worker. request() below derefs
+    // this.worker!, so guarding here keeps the degradation graceful.
+    if (!this.isReady) return [];
+    return this.request<ClusteredEvent[]>(
+      'cluster',
+      { items, sourceTiers: SOURCE_TIERS },
+      30000,
+      'Clustering request timed out'
+    );
   }
 
   /**
@@ -210,31 +237,18 @@ class AnalysisWorkerManager {
     markets: MarketData[]
   ): Promise<CorrelationSignal[]> {
     await this.waitForReady();
-
-    return new Promise((resolve, reject) => {
-      const id = this.generateId();
-
-      // Set timeout (10 seconds should be plenty for correlation)
-      const timeout = setTimeout(() => {
-        this.pendingRequests.delete(id);
-        reject(new Error('Correlation analysis request timed out'));
-      }, 10000);
-
-      this.pendingRequests.set(id, {
-        resolve: resolve as (value: unknown) => void,
-        reject,
-        timeout,
-      });
-
-      this.worker!.postMessage({
-        type: 'correlation',
-        id,
+    if (!this.isReady) return [];
+    return this.request<CorrelationSignal[]>(
+      'correlation',
+      {
         clusters,
         predictions,
         markets,
         sourceTypes: SOURCE_TYPES as Record<string, SourceType>,
-      });
-    });
+      },
+      10000,
+      'Correlation analysis request timed out'
+    );
   }
 
   /**

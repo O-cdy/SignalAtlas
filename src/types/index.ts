@@ -1,10 +1,74 @@
+export type DataSourceId =
+  | 'acled'
+  | 'opensky'
+  | 'wingbits'
+  | 'ais'
+  | 'usgs'
+  | 'gdelt'
+  | 'gdelt_doc'
+  | 'rss'
+  | 'polymarket'
+  | 'predictions'
+  | 'pizzint'
+  | 'outages'
+  | 'cyber_threats'
+  | 'weather'
+  | 'ontario_511'
+  | 'alberta_511'
+  | 'toronto_roads'
+  | 'bc_open511'
+  | 'economic'
+  | 'oil'
+  | 'spending'
+  | 'firms'
+  | 'acled_conflict'
+  | 'ucdp'
+  | 'hapi'
+  | 'ucdp_events'
+  | 'unhcr'
+  | 'climate'
+  | 'worldpop'
+  | 'giving'
+  | 'bis'
+  | 'bls'
+  | 'wto_trade'
+  | 'supply_chain'
+  | 'security_advisories'
+  | 'gpsjam'
+  | 'sanctions_pressure'
+  | 'radiation'
+  | 'treasury_revenue';
+
+// AppContext lives in src/app/app-context.ts because it references
+// components, services, and utils (top-level aggregate type).
+
+export type HappyContentCategory =
+  | 'science-health'
+  | 'nature-wildlife'
+  | 'humanity-kindness'
+  | 'innovation-tech'
+  | 'climate-wins'
+  | 'culture-community';
+
+export interface TechHQ {
+  id: string;
+  company: string;
+  city: string;
+  country: string;
+  lat: number;
+  lon: number;
+  type: 'faang' | 'unicorn' | 'public';
+  employees?: number;
+  marketCap?: string;
+}
+
 export interface DeductContextDetail {
   query?: string;
   geoContext: string;
   autoSubmit?: boolean;
 }
 
-export type PropagandaRisk = 'low' | 'medium' | 'high';
+export type PropagandaRisk = 'low' | 'medium' | 'high' | 'unknown';
 
 export interface Feed {
   name: string;
@@ -13,28 +77,75 @@ export interface Feed {
   region?: string;
   propagandaRisk?: PropagandaRisk;
   stateAffiliated?: string;  // e.g., "Russia", "China", "Iran"
-  lang?: string;             // ISO 2-letter code for filtering
+  lang?: string;             // ISO 2-letter code for filtering (locale boost)
+  strategicDefault?: boolean; // always default-on regardless of UI language
 }
 
-export type { ThreatClassification, ThreatLevel, EventCategory } from '@/services/threat-classifier';
+export type ThreatLevel = 'critical' | 'high' | 'medium' | 'low' | 'info';
+
+export type EventCategory =
+  | 'conflict' | 'protest' | 'disaster' | 'diplomatic' | 'economic'
+  | 'terrorism' | 'cyber' | 'health' | 'environmental' | 'military'
+  | 'crime' | 'infrastructure' | 'tech' | 'general';
+
+export interface ThreatClassification {
+  level: ThreatLevel;
+  category: EventCategory;
+  confidence: number;
+  source: 'keyword' | 'ml' | 'llm';
+}
+
+export type StoryPhase = 'breaking' | 'developing' | 'sustained' | 'fading';
+
+export interface StoryMeta {
+  firstSeen: number;        // epoch ms
+  mentionCount: number;
+  sourceCount: number;
+  phase: StoryPhase;
+}
+
 
 export interface NewsItem {
   source: string;
   title: string;
   link: string;
   pubDate: Date;
+  /**
+   * True when the upstream feed item had no parseable pubDate/published/
+   * updated timestamp. The `pubDate` field is still populated (synthesized
+   * stamp) for display, but ranking/recency consumers MUST route through
+   * `effectivePubDateMs` from feed-date.ts so these items don't claim
+   * false freshness. Optional so synthesized items from non-RSS producers
+   * don't need to set it explicitly — `undefined` is treated as `false`.
+   */
+  pubDateMissing?: boolean;
   isAlert: boolean;
   monitorColor?: string;
   tier?: number;
-  threat?: import('@/services/threat-classifier').ThreatClassification;
+  threat?: ThreatClassification;
   lat?: number;
   lon?: number;
   locationName?: string;
   lang?: string;
-  // Happy variant: positive content category
-  happyCategory?: import('@/services/positive-classifier').HappyContentCategory;
-  // Image URL extracted from RSS media/enclosure tags
+  happyCategory?: HappyContentCategory;
   imageUrl?: string;
+  importanceScore?: number;
+  corroborationCount?: number;
+  storyMeta?: StoryMeta;
+  /**
+   * Cleaned RSS/Atom article description — HTML-stripped, entity-decoded,
+   * whitespace-normalised, ≤400 chars. Empty string when the upstream feed
+   * didn't carry a description or it was indistinguishable from the headline.
+   * Consumers MUST fall back to `title` for display when absent (R6).
+   */
+  snippet?: string;
+  /**
+   * Stock tickers extracted at ingest (#4922a): cashtags + company-name
+   * dictionary matches from title + description. Uppercase, deduped,
+   * first-occurrence order, ≤8. Absent on pre-rollout cached items and
+   * non-digest producers.
+   */
+  tickers?: string[];
 }
 
 export type VelocityLevel = 'normal' | 'elevated' | 'spike';
@@ -54,7 +165,14 @@ export interface ClusteredEvent {
   primaryTitle: string;
   primarySource: string;
   primaryLink: string;
+  /** Articles in the cluster — a volume signal, not a corroboration signal. */
   sourceCount: number;
+  /**
+   * Distinct PUBLISHERS behind those articles (#6428). Any "N sources"
+   * corroboration claim shown to a user reads this, never sourceCount:
+   * one newsroom's editions are one publisher.
+   */
+  uniquePublisherCount: number;
   topSources: Array<{ name: string; tier: number; url: string }>;
   allItems: NewsItem[];
   firstSeen: Date;
@@ -62,7 +180,7 @@ export interface ClusteredEvent {
   isAlert: boolean;
   monitorColor?: string;
   velocity?: VelocityMetrics;
-  threat?: import('@/services/threat-classifier').ThreatClassification;
+  threat?: ThreatClassification;
   lat?: number;
   lon?: number;
   lang?: string;
@@ -117,6 +235,14 @@ export interface CryptoData {
   sparkline?: number[];
 }
 
+export interface TokenData {
+  name: string;
+  symbol: string;
+  price: number;
+  change24h: number;
+  change7d: number;
+}
+
 export type EscalationTrend = 'escalating' | 'stable' | 'de-escalating';
 
 export interface DynamicEscalationScore {
@@ -166,6 +292,8 @@ export interface Hotspot {
 
 export interface StrategicWaterway {
   id: string;
+  /** Canonical chokepoint ID from chokepoint-registry.ts — same as id. */
+  chokepointId: string;
   name: string;
   lat: number;
   lon: number;
@@ -207,6 +335,12 @@ export interface APTGroup {
   sponsor: string;
   lat: number;
   lon: number;
+  mitreId?: string;
+  mitreUrl?: string;
+  description?: string;
+  tactics?: string[];
+  targetSectors?: string[];
+  active?: boolean;
 }
 
 export type CyberThreatType = 'c2_server' | 'malware_host' | 'phishing' | 'malicious_url';
@@ -244,6 +378,8 @@ export interface ConflictZone {
   location?: string;
   description?: string;
   keyDevelopments?: string[];
+  peaceAgreements?: string[];
+  totalFatalities?: string;
 }
 
 
@@ -433,6 +569,10 @@ export interface NuclearFacility {
   type: NuclearFacilityType;
   status: 'active' | 'contested' | 'inactive' | 'decommissioned' | 'construction';
   operator?: string;  // Operating country
+  operationalSince?: string;
+  treaties?: string[];
+  iaeaStatus?: string;
+  keyEvents?: string[];
 }
 
 export interface GammaIrradiator {
@@ -499,6 +639,16 @@ export interface PanelConfig {
   enabled: boolean;
   priority?: number;
   premium?: 'locked' | 'enhanced';
+  /** Absolute panel text scale. When absent, the panel follows the global scale. */
+  fontScale?: 0.9 | 1 | 1.1 | 1.25 | 1.5 | 2;
+  /**
+   * Set by `enforceFreePanelLimit` when the free-tier pro gate — not the user —
+   * is what turned this panel off. Distinguishes "hidden because you aren't Pro"
+   * from "you hid it in settings", so the gate can be reversed on upgrade
+   * without overriding a deliberate choice. Used for both `cw-*` panels and
+   * ordinary panels disabled by the free panel-count cap.
+   */
+  proGated?: boolean;
 }
 
 export interface MapLayers {
@@ -510,8 +660,13 @@ export interface MapLayers {
   ais: boolean;
   nuclear: boolean;
   irradiators: boolean;
+  radiationWatch?: boolean;
   sanctions: boolean;
   weather: boolean;
+  /** Official Canada road events and conditions from Ontario, Alberta, Toronto, and British Columbia. */
+  canadaRoads: boolean;
+  /** Alberta Emergency Alert (and later provincial siblings) (#6610). */
+  canadaAlerts: boolean;
   economic: boolean;
   waterways: boolean;
   outages: boolean;
@@ -553,15 +708,29 @@ export interface MapLayers {
   iranAttacks: boolean;
   // GPS/GNSS interference layer
   gpsJamming: boolean;
+  // Satellite orbital tracking + imagery footprints
+  satellites: boolean;
 
   // CII choropleth layer
   ciiChoropleth: boolean;
+  // Resilience choropleth layer
+  resilienceScore: boolean;
   // Overlay layers
   dayNight: boolean;
   // Commodity variant layers
   miningSites: boolean;
   processingPlants: boolean;
   commodityPorts: boolean;
+  webcams: boolean;
+  // Health layers
+  diseaseOutbreaks: boolean;
+  // Energy variant layers (new — optional so existing MapLayers literals
+  // across all other variants remain valid without touching them).
+  storageFacilities?: boolean;
+  fuelShortages?: boolean;
+  /** Live tanker positions (AIS ship type 80-89) inside chokepoint bboxes.
+   *  Refreshed every 60s via getVesselSnapshot. Energy Atlas parity-push. */
+  liveTankers?: boolean;
 }
 
 export interface AIDataCenter {
@@ -665,6 +834,7 @@ export interface SocialUnrestEvent {
   severity: ProtestSeverity;
   fatalities?: number;
   sources: string[];
+  sourceUrls?: string[];
   sourceType: ProtestSource;
   tags?: string[];
   actors?: string[];
@@ -731,6 +901,7 @@ export type MilitaryOperator =
 
 export interface MilitaryFlight {
   id: string;
+  source?: string;
   callsign: string;
   hexCode: string;             // ICAO 24-bit address
   registration?: string;
@@ -817,6 +988,7 @@ export interface MilitaryVessel {
   note?: string;
   usniRegion?: string;
   usniDeploymentStatus?: USNIDeploymentStatus;
+  usniHomePort?: string;
   usniStrikeGroup?: string;
   usniActivityDescription?: string;
   usniArticleUrl?: string;
@@ -951,6 +1123,37 @@ export const NATURAL_EVENT_CATEGORIES: ReadonlySet<NaturalEventCategory> = new S
   'drought', 'dustHaze', 'snow', 'tempExtremes', 'seaLakeIce', 'waterColor', 'manmade',
 ]);
 
+export interface ForecastPoint {
+  lat: number;
+  lon: number;
+  hour: number;
+  windKt: number;
+  category: number;
+}
+
+export interface PastTrackPoint {
+  lat: number;
+  lon: number;
+  windKt: number;
+  timestamp: number;
+}
+
+/** A single agency report retained on a canonical tropical cyclone event. */
+export interface CycloneAgencyObservation {
+  agency: string;
+  agencyId: string;
+  observedAt: number;
+  lat: number;
+  lon: number;
+  windKt?: number;
+  windAveragingPeriodMinutes?: number;
+  pressureMb?: number;
+  classification?: string;
+  status: string;
+  sourceName?: string;
+  sourceUrl?: string;
+}
+
 export interface NaturalEvent {
   id: string;
   title: string;
@@ -965,6 +1168,23 @@ export interface NaturalEvent {
   sourceUrl?: string;
   sourceName?: string;
   closed: boolean;
+  stormId?: string;
+  stormName?: string;
+  basin?: string;
+  stormCategory?: number;
+  classification?: string;
+  windKt?: number;
+  pressureMb?: number;
+  movementDir?: number;
+  movementSpeedKt?: number;
+  forecastTrack?: ForecastPoint[];
+  conePolygon?: number[][][];
+  pastTrack?: PastTrackPoint[];
+  canonicalId?: string;
+  matchingConfidence?: string;
+  canonicalAliases?: string[];
+  windAveragingPeriodMinutes?: number;
+  agencyObservations?: CycloneAgencyObservation[];
 }
 
 // Infrastructure Cascade Types
@@ -1039,8 +1259,18 @@ export interface CascadeResult {
   }[];
 }
 
-// Re-export port types
-export type { Port, PortType } from '@/config/ports';
+export type PortType = 'container' | 'oil' | 'lng' | 'naval' | 'mixed' | 'bulk';
+
+export interface Port {
+  id: string;
+  name: string;
+  lat: number;
+  lon: number;
+  country: string;
+  type: PortType;
+  rank?: number;
+  note: string;
+}
 
 // AI Regulation Types
 export type RegulationType = 'comprehensive' | 'sectoral' | 'voluntary' | 'proposed';
@@ -1263,6 +1493,8 @@ export interface GulfInvestment {
 
 export interface MapProtestCluster {
   id: string;
+  /** Explicit leaf/group discriminant set at Supercluster flatten time (see DeckGLMap). */
+  _kind: 'leaf' | 'group';
   _clusterId?: number;
   lat: number;
   lon: number;
@@ -1281,11 +1513,13 @@ export interface MapProtestCluster {
 
 export interface MapTechHQCluster {
   id: string;
+  /** Explicit leaf/group discriminant set at Supercluster flatten time (see DeckGLMap). */
+  _kind: 'leaf' | 'group';
   _clusterId?: number;
   lat: number;
   lon: number;
   count: number;
-  items: import('@/config/tech-geo').TechHQ[];
+  items: TechHQ[];
   city: string;
   country: string;
   primaryType: 'faang' | 'unicorn' | 'public';
@@ -1297,6 +1531,8 @@ export interface MapTechHQCluster {
 
 export interface MapTechEventCluster {
   id: string;
+  /** Explicit leaf/group discriminant set at Supercluster flatten time (see DeckGLMap). */
+  _kind: 'leaf' | 'group';
   _clusterId?: number;
   lat: number;
   lon: number;
@@ -1311,6 +1547,8 @@ export interface MapTechEventCluster {
 
 export interface MapDatacenterCluster {
   id: string;
+  /** Explicit leaf/group discriminant set at Supercluster flatten time (see DeckGLMap). */
+  _kind: 'leaf' | 'group';
   _clusterId?: number;
   lat: number;
   lon: number;
@@ -1324,4 +1562,34 @@ export interface MapDatacenterCluster {
   existingCount?: number;
   plannedCount?: number;
   sampled?: boolean;
+}
+
+export interface CountryBriefSignals {
+  criticalNews: number;
+  protests: number;
+  militaryFlights: number;
+  militaryVessels: number;
+  militaryFlightsInCountry: number;
+  militaryVesselsInCountry: number;
+  outages: number;
+  aisDisruptions: number;
+  satelliteFires: number;
+  radiationAnomalies: number;
+  temporalAnomalies: number;
+  cyberThreats: number;
+  earthquakes: number;
+  displacementOutflow: number;
+  climateStress: number;
+  conflictEvents: number;
+  activeStrikes: number;
+  orefSirens: number;
+  orefHistory24h: number;
+  aviationDisruptions: number;
+  travelAdvisories: number;
+  travelAdvisoryMaxLevel: string | null;
+  gpsJammingHexes: number;
+  isTier1: boolean;
+  thermalEscalations: number;
+  sanctionsDesignations: number;
+  sanctionsNewDesignations: number;
 }

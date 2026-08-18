@@ -1,109 +1,288 @@
+import { useState, useEffect, useRef, createContext, useContext, type ReactElement, type ReactNode } from 'react';
+import type { UserResource } from '@clerk/types';
+import * as Sentry from '@sentry/react';
 import { motion } from 'motion/react';
 import {
-  Globe, Activity, ShieldAlert, Zap, Terminal, Database,
+  Globe, ShieldAlert, Zap, Terminal, Database,
   Send, MessageCircle, Mail, MessageSquare, ChevronDown,
   ArrowRight, Check, Lock, Server, Cpu, Layers,
   Bell, Brain, Key, Plug, PanelTop, ExternalLink,
   BarChart3, Clock, Radio, Ship, Plane, Flame,
-  Cable, Wifi, MapPin, Users, TrendingUp
+  Cable, Wifi, MapPin, TrendingUp,
+  Filter, Lightbulb, SlidersHorizontal, Telescope,
+  LineChart, Search, Shield, Building2,
+  Landmark, Fuel
 } from 'lucide-react';
+import { t } from './i18n';
+import { ensureClerk, tryResumeCheckoutFromUrl } from './services/checkout';
+import { scheduleClerkLoad, subscribeClerkLoaded } from './services/clerk';
+import { startClerkUserStateSync, type ClerkUserState } from './services/clerk-user-state';
+import { hasLiveClientSession } from './services/clerk-session';
+import { PricingSection } from './components/PricingSection';
+import { SoonBadge } from './components/SoonBadge';
+import { Logo } from './components/Logo';
+import { WiredBadge } from './components/WiredBadge';
+import { Footer } from './components/Footer';
+import {
+  DASHBOARD_SCREENSHOT_JPG,
+  DASHBOARD_SCREENSHOT_AVIF_SRCSET,
+  DASHBOARD_SCREENSHOT_WEBP_SRCSET,
+} from './assets/dashboard-screenshot';
+import { ensureTurnstileScript } from './turnstile';
+import wiredLogo from './assets/wired-logo.svg';
+import {
+  DASHBOARD_EMBED_PREVIEW_URL,
+  DASHBOARD_PATH,
+  DASHBOARD_URL,
+} from './routes';
+import { appendStoredContentAttributionToUrl } from '../../shared/content-attribution';
+import { isInternalSourceTag } from '../../shared/referral-namespaces';
 
-const API_BASE = location.hostname === 'localhost' ? 'https://api.worldmonitor.app' : '';
+const API_BASE = 'https://api.worldmonitor.app/api';
 const TURNSTILE_SITE_KEY = '0x4AAAAAACnaYgHIyxclu8Tj';
-const PRO_URL = 'https://worldmonitor.app/pro';
 
 declare global {
-  interface Window { turnstile?: { getResponse: (id?: string) => string | undefined; reset: (id?: string) => void; }; }
+  interface Window {
+    turnstile?: {
+      render: (container: string | HTMLElement, opts: Record<string, unknown>) => string;
+      getResponse: (widgetOrId?: string | HTMLElement) => string | undefined;
+      reset: (widgetOrId?: string | HTMLElement) => void;
+    };
+  }
 }
 
+export function renderTurnstileWidgets(): number {
+  if (!window.turnstile) return 0;
+  let count = 0;
+  document.querySelectorAll<HTMLElement>('.cf-turnstile:not([data-rendered])').forEach(el => {
+    const widgetId = window.turnstile!.render(el, {
+      sitekey: TURNSTILE_SITE_KEY,
+      size: 'flexible',
+      callback: (token: string) => { el.dataset.token = token; },
+      'expired-callback': () => { delete el.dataset.token; },
+      'error-callback': () => { delete el.dataset.token; },
+    });
+    el.dataset.rendered = 'true';
+    el.dataset.widgetId = String(widgetId);
+    count++;
+  });
+  return count;
+}
+
+/**
+ * The single entry point for this page's inbound referral code. Every
+ * consumer goes through it — the dashboard CTAs via appendRefToUrl and
+ * PricingSection, which hands the value to startCheckout and from there to
+ * Dodo as `affonso_referral`.
+ *
+ * Internal source tags are rejected here rather than at each consumer: an
+ * internal tag is not an affiliate code on this surface either, and this page
+ * reaches checkout without ever passing through the dashboard's
+ * referral-capture guard (#6493).
+ */
 function getRefCode(): string | undefined {
   const params = new URLSearchParams(window.location.search);
-  return params.get('ref') || undefined;
+  const code = params.get('ref') || undefined;
+  if (!code || isInternalSourceTag(code)) return undefined;
+  return code;
 }
 
-function sanitize(val: unknown): string {
-  return String(val ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] || c));
+/**
+ * Carry the current visit's referral code into a dashboard-target URL.
+ * Ensures `/pro?ref=X` → hero "try the dashboard" click propagates the
+ * code to the dashboard, where captureReferralFromUrl() in App.ts
+ * persists it to localStorage for a later in-dashboard upgrade. Writes
+ * with the `wm_referral=` name because the dashboard uses that going
+ * forward; the /pro page itself still accepts `ref=` for inbound
+ * compatibility with existing share links.
+ *
+ * Validates against the same charset as the dashboard's `isValidCode`
+ * (alphanumeric + `-` + `_`, ≤64 chars) so a hostile `/pro?ref=` value
+ * doesn't briefly appear in the dashboard URL on arrival before the
+ * dashboard-side validator strips it. Invalid codes return the URL
+ * unchanged so the link still works without attribution.
+ */
+const REFERRAL_CODE_REGEX = /^[a-zA-Z0-9_-]+$/;
+function isValidRefCode(code: string): boolean {
+  return code.length > 0 && code.length <= 64 && REFERRAL_CODE_REGEX.test(code);
 }
 
-function showReferralSuccess(formEl: HTMLFormElement, data: { referralCode?: string; position?: number }) {
-  if (!data.referralCode) return;
-  const safeCode = sanitize(data.referralCode);
-  const safePosition = sanitize(data.position);
-  const referralLink = `${PRO_URL}?ref=${safeCode}`;
-  const shareText = encodeURIComponent('I just joined the World Monitor Pro waitlist \u2014 real-time global intelligence powered by AI. Join me:');
-  const shareUrl = encodeURIComponent(referralLink);
-
-  const el = (tag: string, cls: string, text?: string) => {
-    const node = document.createElement(tag);
-    node.className = cls;
-    if (text) node.textContent = text;
-    return node;
-  };
-
-  const successDiv = el('div', 'text-center');
-
-  const badge = el('div', 'inline-block bg-wm-card border border-wm-green/30 px-6 py-4 mb-4');
-  badge.appendChild(el('p', 'text-xs text-wm-green font-mono uppercase tracking-widest mb-1', 'Your position'));
-  badge.appendChild(el('p', 'text-4xl font-display font-bold text-wm-text', `#${safePosition || '?'}`));
-  successDiv.appendChild(badge);
-
-  successDiv.appendChild(el('p', 'text-sm text-wm-muted mb-4', 'Share your link to move up the line. Each friend who joins bumps you closer to the front.'));
-
-  const linkBox = el('div', 'bg-wm-card border border-wm-border px-4 py-3 mb-4 font-mono text-xs text-wm-green break-all select-all cursor-pointer', referralLink);
-  linkBox.addEventListener('click', () => {
-    navigator.clipboard.writeText(referralLink).then(() => {
-      linkBox.textContent = 'Copied!';
-      setTimeout(() => { linkBox.textContent = referralLink; }, 2000);
-    });
+function appendRefToUrl(url: string, refCode: string | undefined): string {
+  let nextUrl = appendStoredContentAttributionToUrl(url, {
+    destination: 'dashboard',
+    placement: 'pro-dashboard-cta',
   });
-  successDiv.appendChild(linkBox);
-
-  const shareRow = el('div', 'flex gap-3 justify-center flex-wrap');
-  const shareLinks = [
-    { label: 'Share on X', href: `https://x.com/intent/tweet?text=${shareText}&url=${shareUrl}` },
-    { label: 'LinkedIn', href: `https://www.linkedin.com/sharing/share-offsite/?url=${shareUrl}` },
-    { label: 'WhatsApp', href: `https://wa.me/?text=${shareText}%20${shareUrl}` },
-    { label: 'Telegram', href: `https://t.me/share/url?url=${shareUrl}&text=${encodeURIComponent('Join the World Monitor Pro waitlist:')}` },
-  ];
-  for (const s of shareLinks) {
-    const a = el('a', 'bg-wm-card border border-wm-border px-4 py-2 text-xs font-mono text-wm-muted hover:text-wm-text hover:border-wm-text transition-colors', s.label);
-    (a as HTMLAnchorElement).href = s.href;
-    (a as HTMLAnchorElement).target = '_blank';
-    (a as HTMLAnchorElement).rel = 'noreferrer';
-    shareRow.appendChild(a);
+  if (!refCode || !isValidRefCode(refCode)) return nextUrl;
+  try {
+    const parsed = new URL(nextUrl, window.location.href);
+    parsed.searchParams.set('wm_referral', refCode);
+    nextUrl = parsed.toString();
+  } catch {
+    const sep = nextUrl.includes('?') ? '&' : '?';
+    nextUrl = `${nextUrl}${sep}wm_referral=${encodeURIComponent(refCode)}`;
   }
-  successDiv.appendChild(shareRow);
-
-  formEl.replaceWith(successDiv);
+  return nextUrl;
 }
 
-async function submitWaitlist(email: string, formEl: HTMLFormElement) {
-  const btn = formEl.querySelector('button[type="submit"]') as HTMLButtonElement;
-  const origText = btn.textContent;
-  btn.disabled = true;
-  btn.textContent = 'Submitting...';
+function openSignIn(): void {
+  ensureClerk().then(c => c.openSignIn()).catch((err) => {
+    console.error('[auth] Failed to open sign in:', err);
+    Sentry.captureException(err, { tags: { surface: 'pro-marketing', action: 'open-sign-in' } });
+  });
+}
 
-  const honeypot = (formEl.querySelector('input[name="website"]') as HTMLInputElement)?.value || '';
-  const turnstileWidget = formEl.querySelector('.cf-turnstile') as HTMLElement | null;
-  const widgetId = turnstileWidget?.dataset.widgetId;
-  const turnstileToken = window.turnstile?.getResponse(widgetId) || '';
-  const ref = getRefCode();
+/**
+ * Lightweight /pro auth state. The live __session JWT gives us an immediate
+ * signed-in signal without loading Clerk; the real Clerk user is filled in only
+ * after the SDK is loaded from an auth action or an idle signed-in load.
+ *
+ * Used by the Navbar to swap the SIGN IN button for Clerk's UserButton avatar
+ * once the visitor is authenticated, and by the Hero to hide its redundant
+ * SIGN IN CTA. Single source of truth for "is the /pro visitor signed in".
+ */
+function useClerkUser(): ClerkUserState {
+  const [state, setState] = useState<ClerkUserState>(() => ({
+    user: null,
+    isLoaded: true,
+    signedIn: hasLiveClientSession(),
+  }));
 
-  try {
-    const res = await fetch(`${API_BASE}/register-interest`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, source: 'pro-waitlist', website: honeypot, turnstileToken, referredBy: ref }),
+  useEffect(() => {
+    return startClerkUserStateSync(setState, {
+      hasLiveClientSession,
+      subscribeClerkLoaded,
+      scheduleClerkLoad,
+      onLoadError(err) {
+        console.error('[auth] Failed to load Clerk for nav auth state:', err);
+        Sentry.captureException(err, { tags: { surface: 'pro-marketing', action: 'load-clerk-for-nav' } });
+        setState({ user: null, isLoaded: true, signedIn: false });
+      },
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Registration failed');
-    showReferralSuccess(formEl, data);
-  } catch (err: any) {
-    btn.textContent = err.message === 'Too many requests' ? 'Too many requests' : 'Failed \u2014 try again';
-    btn.disabled = false;
-    window.turnstile?.reset(widgetId);
-    setTimeout(() => { btn.textContent = origText; }, 3000);
-  }
+  }, []);
+
+  return state;
+}
+
+/**
+ * Entitlement state shared across /pro — `isPro: true` when the signed-in
+ * visitor has an active Pro entitlement, either via Clerk pro role OR a
+ * Convex Dodo subscription (tier >= 1). The provider below performs
+ * exactly one /api/me/entitlement fetch per page load and makes the
+ * result available via useProEntitlement(); Navbar and Hero (and any
+ * future caller) share a single source of truth, so the nav and hero
+ * can't disagree on transient failures.
+ *
+ * Defaults to `{ isPro: false, isChecked: false }` for consumers that
+ * render without a provider (e.g. tests) — matches the closed-by-default
+ * stance for unpaid visitors.
+ */
+type ProEntitlementState = { isPro: boolean; isChecked: boolean };
+const ProEntitlementContext = createContext<ProEntitlementState>({ isPro: false, isChecked: false });
+
+function ProEntitlementProvider({ children }: { children: ReactNode }): ReactElement {
+  const { user, signedIn } = useClerkUser();
+  const userId = user?.id ?? null;
+  const [state, setState] = useState<ProEntitlementState>({ isPro: false, isChecked: false });
+
+  useEffect(() => {
+    if (!signedIn) {
+      setState({ isPro: false, isChecked: true });
+      return;
+    }
+    if (!userId) {
+      setState({ isPro: false, isChecked: false });
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const clerk = await ensureClerk();
+        // Clerk can expose `user` before its session-token endpoint is
+        // ready; a first null return is a known transient, not a final
+        // "no token." Retry once after a 2s gap — same pattern as
+        // services/checkout.ts:getAuthToken. Without the retry, a real
+        // Pro user hitting /pro on a cold Clerk load gets a permanent
+        // isPro=false for the whole session.
+        let token = await clerk.session?.getToken().catch(() => null);
+        if (!token) {
+          await new Promise((r) => setTimeout(r, 2000));
+          token = await clerk.session?.getToken().catch(() => null);
+        }
+        if (!token) {
+          if (!cancelled) setState({ isPro: false, isChecked: true });
+          return;
+        }
+        const resp = await fetch(`${API_BASE}/me/entitlement`, {
+          headers: { Authorization: `Bearer ${token}` },
+          signal: AbortSignal.timeout(8_000),
+        });
+        if (!resp.ok) {
+          if (!cancelled) setState({ isPro: false, isChecked: true });
+          return;
+        }
+        const data = await resp.json() as { isPro?: boolean };
+        if (!cancelled) setState({ isPro: data.isPro === true, isChecked: true });
+      } catch (err) {
+        console.error('[auth] Failed to check pro entitlement:', err);
+        Sentry.captureException(err, { tags: { surface: 'pro-marketing', action: 'check-entitlement' } });
+        if (!cancelled) setState({ isPro: false, isChecked: true });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [signedIn, userId]);
+
+  return <ProEntitlementContext.Provider value={state}>{children}</ProEntitlementContext.Provider>;
+}
+
+function useProEntitlement(): ProEntitlementState {
+  return useContext(ProEntitlementContext);
+}
+
+/**
+ * Mounts Clerk's native UserButton (avatar + dropdown with profile + sign
+ * out) into a DOM node. Using Clerk's built-in widget avoids reimplementing
+ * a signed-in UI from scratch and inherits theming from the existing
+ * clerk.load() appearance options in services/checkout.ts.
+ */
+function ClerkUserButton({ user }: { user: UserResource | null }): ReactElement {
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!user) return;
+    if (!ref.current) return;
+    const el = ref.current;
+    let unmounted = false;
+
+    ensureClerk()
+      .then((clerk) => {
+        if (unmounted || !el) return;
+        clerk.mountUserButton(el, {
+          afterSignOutUrl: 'https://www.worldmonitor.app/pro',
+        });
+      })
+      .catch((err) => {
+        console.error('[auth] Failed to mount user button:', err);
+        Sentry.captureException(err, { tags: { surface: 'pro-marketing', action: 'mount-user-button' } });
+      });
+
+    return () => {
+      unmounted = true;
+      ensureClerk().then((clerk) => {
+        if (el) clerk.unmountUserButton(el);
+      }).catch(() => { /* mount path already failed */ });
+    };
+  }, [user]);
+
+  return (
+    <div ref={ref} className="flex h-8 w-8 items-center justify-center">
+      {!user && (
+        <span
+          className="block h-8 w-8 rounded-full border border-wm-border bg-wm-card shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04)]"
+          aria-hidden="true"
+        />
+      )}
+    </div>
+  );
 }
 
 const SlackIcon = () => (
@@ -112,99 +291,346 @@ const SlackIcon = () => (
   </svg>
 );
 
-const Logo = () => (
-  <a href="https://worldmonitor.app" className="flex items-center gap-2 hover:opacity-80 transition-opacity" aria-label="World Monitor — Home">
-    <div className="relative w-8 h-8 rounded-full bg-wm-card border border-wm-border flex items-center justify-center overflow-hidden">
-      <Globe className="w-5 h-5 text-wm-blue opacity-50 absolute" aria-hidden="true" />
-      <Activity className="w-6 h-6 text-wm-green absolute z-10" aria-hidden="true" />
-    </div>
-    <div className="flex flex-col">
-      <span className="font-display font-bold text-sm leading-none tracking-tight">WORLD MONITOR</span>
-      <span className="text-[9px] text-wm-muted font-mono uppercase tracking-widest leading-none mt-1">by Someone.ceo</span>
-    </div>
-  </a>
-);
-
-const Navbar = () => (
-  <nav className="fixed top-0 left-0 right-0 z-50 glass-panel border-b-0 border-x-0 rounded-none" aria-label="Main navigation">
-    <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
-      <Logo />
-      <div className="hidden md:flex items-center gap-8 text-sm font-mono text-wm-muted">
-        <a href="#tiers" className="hover:text-wm-text transition-colors">Free</a>
-        <a href="#pro" className="hover:text-wm-green transition-colors">Pro</a>
-        <a href="#api" className="hover:text-wm-text transition-colors">API</a>
-        <a href="#enterprise" className="hover:text-wm-text transition-colors">Enterprise</a>
+/* ─── 0. Navbar ─── */
+const Navbar = () => {
+  const { user, isLoaded, signedIn } = useClerkUser();
+  const { isPro, isChecked } = useProEntitlement();
+  // Show "Go to Dashboard" instead of "Upgrade to Pro" once we confirm
+  // the visitor is already a paying customer. Until the entitlement
+  // check completes we keep the upgrade CTA in place — a signed-in
+  // free user would see a one-frame flash otherwise, which is less
+  // annoying than showing "Go to Dashboard" for half a second to a
+  // visitor who hasn't paid.
+  const showGoToDashboard = isLoaded && signedIn && !!user && isChecked && isPro;
+  return (
+    <nav className="fixed top-0 left-0 right-0 z-50 glass-panel border-b-0 border-x-0 rounded-none" aria-label="Main navigation">
+      <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
+        <Logo />
+        <div className="hidden md:flex items-center gap-8 text-sm font-mono text-wm-muted">
+          <a href="#tiers" className="hover:text-wm-text transition-colors">{t('nav.free')}</a>
+          <a href="#pro" className="hover:text-wm-green transition-colors">{t('nav.pro')}</a>
+          <a href="#api" className="hover:text-wm-text transition-colors">{t('nav.api')}</a>
+          <a href="#enterprise" className="hover:text-wm-text transition-colors">{t('nav.enterprise')}</a>
+        </div>
+        <div className="flex items-center gap-2">
+          {isLoaded && (signedIn
+            ? <ClerkUserButton user={user} />
+            : (
+              <button
+                type="button"
+                onClick={openSignIn}
+                className="border border-wm-border text-wm-text px-4 py-2 rounded-sm font-mono text-xs uppercase tracking-wider font-bold hover:border-wm-text transition-colors"
+              >
+                {t('nav.signIn')}
+              </button>
+            ))}
+          {showGoToDashboard ? (
+            <a
+              href={appendRefToUrl(DASHBOARD_URL, getRefCode())}
+              className="bg-wm-green text-wm-bg px-4 py-2 rounded-sm font-mono text-xs uppercase tracking-wider font-bold hover:bg-green-400 transition-colors inline-flex items-center gap-1.5"
+            >
+              {t('nav.goToDashboard')} <ArrowRight className="w-3 h-3" aria-hidden="true" />
+            </a>
+          ) : (
+            <a href="#pricing" className="bg-wm-green text-wm-bg px-4 py-2 rounded-sm font-mono text-xs uppercase tracking-wider font-bold hover:bg-green-400 transition-colors">
+              {t('nav.upgradeToPro')}
+            </a>
+          )}
+        </div>
       </div>
-      <a href="#waitlist" className="bg-wm-green text-wm-bg px-4 py-2 rounded-sm font-mono text-xs uppercase tracking-wider font-bold hover:bg-green-400 transition-colors">
-        Join Waitlist
-      </a>
+    </nav>
+  );
+};
+
+/* ─── 1. Hero — Less noise, more signal ─── */
+const SignalBars = () => {
+  const total = 60;
+  const center = total / 2;
+  const signalRadius = 8;
+  const jitter = (index: number, salt: number) => {
+    const x = Math.sin(index * 12.9898 + salt * 78.233) * 43758.5453;
+    return x - Math.floor(x);
+  };
+
+  return (
+    <div className="relative my-4 md:my-8 -mx-6">
+      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+        <div className="w-64 h-40 md:w-96 md:h-56 bg-wm-green/8 rounded-full blur-[80px]" />
+      </div>
+      <div className="flex items-end justify-center gap-[3px] md:gap-1 h-28 md:h-44 relative px-4" aria-hidden="true">
+        {Array.from({ length: total }).map((_, i) => {
+          const distFromCenter = Math.abs(i - center);
+          const isSignal = distFromCenter <= signalRadius;
+          const signalIntensity = isSignal ? 1 - distFromCenter / signalRadius : 0;
+          const peakHeight = 60 + signalIntensity * 110;
+          const noiseBase = Math.max(8, 35 - distFromCenter * 0.8);
+          const barHeight = isSignal ? peakHeight : noiseBase;
+          const initialScale = isSignal ? 0.3 : 0.5;
+          const scaleY = isSignal
+            ? [0.5, 1, 0.65, 0.9]
+            : [1, 0.3, 0.7, 0.15, 0.5];
+
+          return (
+            <div
+              key={i}
+              className="flex flex-1 max-w-2 md:max-w-3 items-end"
+              style={{ height: `${barHeight}px` }}
+            >
+              <motion.div
+                className={`w-full rounded-sm ${isSignal ? 'bg-wm-green' : 'bg-wm-muted/20'}`}
+                style={{
+                  height: '100%',
+                  transformOrigin: 'bottom',
+                  ...(isSignal
+                    ? { boxShadow: `0 0 ${6 + signalIntensity * 12}px rgba(74,222,128,${signalIntensity * 0.5})` }
+                    : null),
+                }}
+                initial={{ scaleY: initialScale, opacity: isSignal ? 0.4 : 0.08 }}
+                animate={isSignal
+                  ? {
+                      scaleY,
+                      opacity: [0.6 + signalIntensity * 0.3, 1, 0.75 + signalIntensity * 0.2, 0.95],
+                    }
+                  : {
+                      scaleY,
+                      opacity: [0.2, 0.06, 0.15, 0.04, 0.12],
+                    }
+                }
+                transition={{
+                  duration: isSignal ? 2.5 + signalIntensity * 0.5 : 1 + jitter(i, 1) * 0.6,
+                  repeat: Infinity,
+                  repeatType: 'reverse',
+                  delay: isSignal ? distFromCenter * 0.07 : jitter(i, 2) * 0.6,
+                  ease: 'easeInOut',
+                }}
+              />
+            </div>
+          );
+        })}
+      </div>
     </div>
-  </nav>
-);
+  );
+};
 
-const WiredBadge = () => (
-  <a
-    href="https://www.wired.me/story/the-music-streaming-ceo-who-built-a-global-war-map"
-    target="_blank"
-    rel="noreferrer"
-    className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full border border-wm-border bg-wm-card/50 text-wm-muted text-xs font-mono hover:border-wm-green/30 hover:text-wm-text transition-colors"
-  >
-    As featured in <span className="text-wm-text font-bold">WIRED</span> <ExternalLink className="w-3 h-3" aria-hidden="true" />
-  </a>
-);
-
-const Hero = () => (
-  <section className="pt-28 pb-16 px-6 relative overflow-hidden">
-    <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_30%,rgba(74,222,128,0.05)_0%,transparent_60%)] pointer-events-none" />
-    <div className="max-w-4xl mx-auto text-center relative z-10">
-      <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.6 }}
-      >
-        <div className="mb-6">
-          <WiredBadge />
-        </div>
-        <h1 className="text-5xl md:text-7xl font-display font-bold tracking-tighter mb-6 leading-[1.1]">
-          Real-time intelligence <br className="hidden md:block" />
-          <span className="text-transparent bg-clip-text bg-gradient-to-r from-wm-green to-emerald-300">for a connected world.</span>
-        </h1>
-        <p className="text-lg md:text-xl text-wm-muted mb-8 max-w-2xl mx-auto font-light">
-          Track geopolitics, markets, energy, infrastructure, and natural events across 435+ sources. AI that tells you what it means — delivered where you work.
-        </p>
-
-        <form className="flex flex-col gap-3 max-w-md mx-auto" onSubmit={(e) => { e.preventDefault(); const form = e.currentTarget; const email = new FormData(form).get('email') as string; submitWaitlist(email, form); }}>
-          {/* Honeypot — hidden from humans, bots auto-fill it */}
-          <input type="text" name="website" autoComplete="off" tabIndex={-1} aria-hidden="true" className="absolute opacity-0 h-0 w-0 pointer-events-none" />
-          <div className="flex flex-col sm:flex-row gap-3">
-            <input
-              type="email"
-              name="email"
-              placeholder="Enter your email"
-              className="flex-1 bg-wm-card border border-wm-border rounded-sm px-4 py-3 text-sm focus:outline-none focus:border-wm-green transition-colors font-mono"
-              required
-              aria-label="Email address for waitlist"
-            />
-            <button type="submit" className="bg-wm-green text-wm-bg px-6 py-3 rounded-sm font-mono text-sm uppercase tracking-wider font-bold hover:bg-green-400 transition-colors flex items-center justify-center gap-2 whitespace-nowrap">
-              Join Pro Waitlist <ArrowRight className="w-4 h-4" aria-hidden="true" />
-            </button>
+const Hero = () => {
+  const { user, isLoaded, signedIn } = useClerkUser();
+  const { isPro, isChecked } = useProEntitlement();
+  // Showing "Sign In" to an already-signed-in user wastes a CTA slot.
+  // Hide it once auth state confirms; falls back to just the "Choose Plan"
+  // CTA which is the relevant action for returning users anyway.
+  const showSignIn = isLoaded && !signedIn;
+  // Swap "Choose Plan" for "Go to Dashboard" once we confirm the visitor
+  // is already Pro — same reasoning as the nav swap, and also removes
+  // the #pricing anchor jump which is actively misleading for a paying
+  // customer.
+  const showGoToDashboard = isLoaded && signedIn && !!user && isChecked && isPro;
+  return (
+    <section className="pt-28 pb-12 px-6 relative overflow-hidden">
+      <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_20%,rgba(74,222,128,0.08)_0%,transparent_50%)] pointer-events-none" />
+      <div className="max-w-4xl mx-auto text-center relative z-10">
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.6 }}
+        >
+          <div className="mb-4">
+            <WiredBadge />
           </div>
-          <div className="cf-turnstile mx-auto" data-sitekey={TURNSTILE_SITE_KEY} data-theme="dark" data-size="compact" />
-        </form>
-        <div className="flex items-center justify-center gap-4 mt-4">
-          <p className="text-xs text-wm-muted font-mono">Launching soon</p>
-          <span className="text-wm-border">|</span>
-          <a href="https://worldmonitor.app" className="text-xs text-wm-green font-mono hover:text-green-300 transition-colors flex items-center gap-1">
-            Try the free dashboard <ArrowRight className="w-3 h-3" aria-hidden="true" />
+
+          <h1 className="text-6xl md:text-8xl font-display font-bold tracking-tighter leading-[0.95]">
+            <span className="text-wm-muted/40">{t('hero.noiseWord')}</span>
+            <span className="mx-3 md:mx-5 text-wm-border/50">→</span>
+            <span className="text-transparent bg-clip-text bg-gradient-to-r from-wm-green to-emerald-300 text-glow">{t('hero.signalWord')}</span>
+          </h1>
+
+          <SignalBars />
+
+          <p className="text-lg md:text-xl text-wm-muted max-w-xl mx-auto font-light leading-relaxed">
+            {t('hero.valueProps')}
+          </p>
+
+          <div className="flex flex-col sm:flex-row gap-3 justify-center mt-8">
+            {showGoToDashboard ? (
+              <a href={appendRefToUrl(DASHBOARD_URL, getRefCode())} className="bg-wm-green text-wm-bg px-6 py-3 rounded-sm font-mono text-sm uppercase tracking-wider font-bold hover:bg-green-400 transition-colors flex items-center justify-center gap-2">
+                {t('hero.goToDashboard')} <ArrowRight className="w-4 h-4" aria-hidden="true" />
+              </a>
+            ) : (
+              <a href="#pricing" className="bg-wm-green text-wm-bg px-6 py-3 rounded-sm font-mono text-sm uppercase tracking-wider font-bold hover:bg-green-400 transition-colors flex items-center justify-center gap-2">
+                {t('hero.choosePlan')} <ArrowRight className="w-4 h-4" aria-hidden="true" />
+              </a>
+            )}
+            {showSignIn && (
+              <button type="button" onClick={openSignIn} className="border border-wm-border text-wm-text px-6 py-3 rounded-sm font-mono text-sm uppercase tracking-wider font-bold hover:border-wm-text transition-colors">
+                {t('hero.signIn')}
+              </button>
+            )}
+          </div>
+
+          <div className="flex items-center justify-center mt-4">
+            <a href={appendRefToUrl(DASHBOARD_URL, getRefCode())} className="text-xs text-wm-green font-mono hover:text-green-300 transition-colors flex items-center gap-1">
+              {t('hero.tryFreeDashboard')} <ArrowRight className="w-3 h-3" aria-hidden="true" />
+            </a>
+          </div>
+        </motion.div>
+      </div>
+    </section>
+  );
+};
+
+/* ─── 2. Social proof (current — WIRED badge already in hero) ─── */
+const SocialProof = () => (
+  <section className="border-y border-wm-border bg-wm-card/30 py-16 px-6">
+    <div className="max-w-5xl mx-auto">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-8 text-center mb-12">
+        {[
+          { value: "2M+", label: t('socialProof.uniqueVisitors') },
+          { value: "421K", label: t('socialProof.peakDailyUsers') },
+          { value: "190+", label: t('socialProof.countriesReached') },
+          { value: "500+", label: t('socialProof.liveDataSources') },
+        ].map((stat, i) => (
+          <div key={i}>
+            <p className="text-3xl md:text-4xl font-display font-bold text-wm-green">{stat.value}</p>
+            <p className="text-xs font-mono text-wm-muted uppercase tracking-widest mt-1">{stat.label}</p>
+          </div>
+        ))}
+      </div>
+      <blockquote className="max-w-3xl mx-auto text-center">
+        <p className="text-lg md:text-xl text-wm-muted italic leading-relaxed">
+          "{t('socialProof.quote')}"
+        </p>
+        <footer className="mt-6 flex items-center justify-center gap-3">
+          <a href="https://www.wired.com/story/world-monitor-elie-habib/" target="_blank" rel="noreferrer" className="inline-flex items-center gap-2 text-wm-muted hover:text-wm-text transition-colors">
+            <img src={wiredLogo} alt="WIRED" loading="lazy" className="h-5 brightness-0 invert opacity-60 hover:opacity-100 transition-opacity" />
           </a>
-        </div>
-      </motion.div>
+        </footer>
+      </blockquote>
     </div>
   </section>
 );
 
+/* ─── 3. Two-path split (new — from draft) ─── */
+const TwoPathSplit = () => (
+  <section className="py-24 px-6 max-w-5xl mx-auto" id="tiers">
+    <h2 className="sr-only">Plans</h2>
+    <div className="grid md:grid-cols-2 gap-8">
+      <div className="bg-wm-card border border-wm-green p-8 relative border-glow">
+        <div className="absolute top-0 left-0 w-full h-1 bg-wm-green" />
+        <h3 className="font-display text-2xl font-bold mb-2">{t('twoPath.proTitle')}</h3>
+        <p className="text-sm text-wm-muted mb-6">{t('twoPath.proDesc')}</p>
+        <ul className="space-y-3 mb-8">
+          {[t('twoPath.proF1'), t('twoPath.proF2'), t('twoPath.proF3'), t('twoPath.proF4'), t('twoPath.proF5'), t('twoPath.proF6'), t('twoPath.proF7'), t('twoPath.proF8'), t('twoPath.proF9')].map((f, i) => (
+            <li key={i} className="flex items-start gap-3 text-sm">
+              <Check className="w-4 h-4 shrink-0 mt-0.5 text-wm-green" aria-hidden="true" />
+              <span className="text-wm-muted">{f}</span>
+            </li>
+          ))}
+        </ul>
+        <a href="#pricing" className="block text-center py-2.5 rounded-sm font-mono text-xs uppercase tracking-wider font-bold bg-wm-green text-wm-bg hover:bg-green-400 transition-colors">
+          {t('twoPath.choosePlan')}
+        </a>
+      </div>
+
+      <div className="bg-wm-card border border-wm-border p-8">
+        <h3 className="font-display text-2xl font-bold mb-2">{t('twoPath.entTitle')}</h3>
+        <p className="text-sm text-wm-muted mb-6">{t('twoPath.entDesc')}</p>
+        <ul className="space-y-3 mb-8">
+          <li className="text-xs font-mono text-wm-green uppercase tracking-wider mb-1">{t('twoPath.entF1')}</li>
+          {[t('twoPath.entF2'), t('twoPath.entF3'), t('twoPath.entF4'), t('twoPath.entF5'), t('twoPath.entF6'), t('twoPath.entF7'), t('twoPath.entF8'), t('twoPath.entF9'), t('twoPath.entF10'), t('twoPath.entF11')].map((f, i) => (
+            <li key={i} className="flex items-start gap-3 text-sm">
+              <Check className="w-4 h-4 shrink-0 mt-0.5 text-wm-muted" aria-hidden="true" />
+              <span className="text-wm-muted">{f}</span>
+            </li>
+          ))}
+        </ul>
+        <a href="#enterprise" className="block text-center py-2.5 rounded-sm font-mono text-xs uppercase tracking-wider font-bold border border-wm-border text-wm-muted hover:text-wm-text hover:border-wm-text transition-colors">
+          {t('twoPath.entCta')}
+        </a>
+      </div>
+    </div>
+  </section>
+);
+
+/* ─── 4. Why Upgrade (new — from draft) ─── */
+const WhyUpgrade = () => {
+  const items = [
+    { icon: <Filter className="w-6 h-6" aria-hidden="true" />, title: t('whyUpgrade.noiseTitle'), desc: t('whyUpgrade.noiseDesc') },
+    { icon: <TrendingUp className="w-6 h-6" aria-hidden="true" />, title: t('whyUpgrade.fasterTitle'), desc: t('whyUpgrade.fasterDesc') },
+    { icon: <SlidersHorizontal className="w-6 h-6" aria-hidden="true" />, title: t('whyUpgrade.controlTitle'), desc: t('whyUpgrade.controlDesc') },
+    { icon: <Telescope className="w-6 h-6" aria-hidden="true" />, title: t('whyUpgrade.deeperTitle'), desc: t('whyUpgrade.deeperDesc') },
+  ];
+
+  return (
+    <section className="py-24 px-6 border-t border-wm-border bg-wm-card/20">
+      <div className="max-w-5xl mx-auto">
+        <h2 className="text-3xl md:text-5xl font-display font-bold mb-16 text-center">{t('whyUpgrade.title')}</h2>
+        <div className="grid md:grid-cols-2 gap-8">
+          {items.map((item, i) => (
+            <div key={i} className="flex gap-5">
+              <div className="text-wm-green shrink-0 mt-1">{item.icon}</div>
+              <div>
+                <h3 className="font-bold text-lg mb-2">{item.title}</h3>
+                <p className="text-sm text-wm-muted leading-relaxed">{item.desc}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+};
+
+/* ─── Three Flagship Pillars (new) ─── */
+const Pillars = () => {
+  const items = [
+    { icon: <Brain className="w-7 h-7" aria-hidden="true" />, title: t('pillars.askIt'), desc: t('pillars.askItDesc') },
+    { icon: <Bell className="w-7 h-7" aria-hidden="true" />, title: t('pillars.subscribeIt'), desc: t('pillars.subscribeItDesc') },
+    { icon: <Plug className="w-7 h-7" aria-hidden="true" />, title: t('pillars.buildOnIt'), desc: t('pillars.buildOnItDesc') },
+  ];
+
+  return (
+    <section className="py-20 px-6 border-t border-wm-border">
+      <div className="max-w-5xl mx-auto">
+        <div className="grid md:grid-cols-3 gap-6">
+          {items.map((item, i) => (
+            <div key={i} className="bg-wm-card border border-wm-border p-6 hover:border-wm-green/30 transition-colors">
+              <div className="text-wm-green mb-4">{item.icon}</div>
+              <h3 className="font-display text-xl font-bold mb-2">{item.title}</h3>
+              <p className="text-sm text-wm-muted leading-relaxed">{item.desc}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+};
+
+/* ─── Delivery Desk (new) ─── */
+const DeliveryDesk = () => (
+  <section className="py-24 px-6 border-t border-wm-border bg-wm-card/20">
+    <div className="max-w-4xl mx-auto text-center">
+      <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-wm-green/30 bg-wm-green/10 text-wm-green text-xs font-mono mb-6">
+        {t('deliveryDesk.eyebrow')}
+      </div>
+      <h2 className="text-3xl md:text-5xl font-display font-bold mb-6">{t('deliveryDesk.title')}</h2>
+      <p className="text-lg text-wm-muted leading-relaxed mb-6">
+        {t('deliveryDesk.body')}
+      </p>
+      <p className="text-xl md:text-2xl font-display font-bold text-wm-green mb-8">
+        {t('deliveryDesk.closer')}
+      </p>
+      <p className="font-mono text-xs text-wm-muted uppercase tracking-widest">
+        {t('deliveryDesk.channels')}
+      </p>
+    </div>
+  </section>
+);
+
+/* ─── 5. Live Dashboard Embed (current) ─── */
+// max-w-6xl (1152px) container inside px-6 section padding.
+const LIVE_PREVIEW_IMAGE_SIZES = '(min-width: 1200px) 1152px, calc(100vw - 3rem)';
+
 const LivePreview = () => (
-  <section className="px-6 pb-16 -mt-4">
+  <section className="px-6 py-16">
     <div className="max-w-6xl mx-auto">
       <div className="relative rounded-lg overflow-hidden border border-wm-border shadow-2xl shadow-wm-green/5">
         <div className="bg-wm-card px-4 py-2 border-b border-wm-border flex items-center gap-3">
@@ -213,53 +639,70 @@ const LivePreview = () => (
             <div className="w-3 h-3 rounded-full bg-yellow-500/70" />
             <div className="w-3 h-3 rounded-full bg-green-500/70" />
           </div>
-          <span className="font-mono text-xs text-wm-muted ml-2">worldmonitor.app — Live Dashboard</span>
+          <span className="font-mono text-xs text-wm-muted ml-2">{t('livePreview.windowTitle')}</span>
           <a
-            href="https://worldmonitor.app"
+            href={appendRefToUrl(DASHBOARD_URL, getRefCode())}
             target="_blank"
             rel="noreferrer"
             className="ml-auto text-xs text-wm-green font-mono hover:text-green-300 transition-colors flex items-center gap-1"
           >
-            Open full screen <ExternalLink className="w-3 h-3" aria-hidden="true" />
+            {t('livePreview.openFullScreen')} <ExternalLink className="w-3 h-3" aria-hidden="true" />
           </a>
         </div>
         <div className="relative aspect-[16/9] bg-black">
+          <picture>
+            <source type="image/avif" srcSet={DASHBOARD_SCREENSHOT_AVIF_SRCSET} sizes={LIVE_PREVIEW_IMAGE_SIZES} />
+            <source type="image/webp" srcSet={DASHBOARD_SCREENSHOT_WEBP_SRCSET} sizes={LIVE_PREVIEW_IMAGE_SIZES} />
+            <img
+              src={DASHBOARD_SCREENSHOT_JPG}
+              alt="World Monitor Dashboard"
+              className="absolute inset-0 w-full h-full object-cover"
+              loading="lazy"
+              decoding="async"
+            />
+          </picture>
           <iframe
-            src="https://worldmonitor.app"
-            title="World Monitor — Live OSINT Dashboard"
-            className="w-full h-full border-0"
+            // ?embed=pro-preview is the unique marker the main app's
+            // IS_EMBEDDED_PREVIEW helper keys off to silence premium-RPC
+            // 401s that otherwise surface in /pro's parent console. See
+            // src/utils/embedded-preview.ts. Not a generic iframe gate —
+            // enterprise white-label embeds without this marker keep
+            // firing premium RPCs normally.
+            src={DASHBOARD_EMBED_PREVIEW_URL}
+            title={t('livePreview.iframeTitle')}
+            className="relative w-full h-full border-0"
             loading="lazy"
-            sandbox="allow-scripts allow-same-origin"
+            sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
           />
           <div className="absolute inset-0 pointer-events-none bg-gradient-to-t from-wm-bg/80 via-transparent to-transparent" />
           <div className="absolute bottom-4 left-0 right-0 text-center pointer-events-auto">
             <a
-              href="https://worldmonitor.app"
+              href={appendRefToUrl(DASHBOARD_URL, getRefCode())}
               target="_blank"
               rel="noreferrer"
               className="inline-flex items-center gap-2 bg-wm-green text-wm-bg px-6 py-3 rounded-sm font-mono text-sm uppercase tracking-wider font-bold hover:bg-green-400 transition-colors"
             >
-              Try the Live Dashboard <ArrowRight className="w-4 h-4" aria-hidden="true" />
+              {t('livePreview.tryLiveDashboard')} <ArrowRight className="w-4 h-4" aria-hidden="true" />
             </a>
           </div>
         </div>
       </div>
       <p className="text-center text-xs text-wm-muted font-mono mt-4">
-        3D WebGL globe &middot; 45+ interactive map layers &middot; Real-time geopolitical, market, energy, and infrastructure data
+        {t('livePreview.description')}
       </p>
     </div>
   </section>
 );
 
+/* ─── 6. Source Marquee (current) ─── */
 const SourceMarquee = () => {
   const sources = [
-    "ACLED", "UCDP", "GDELT", "NASA FIRMS", "USGS", "OpenSky", "AISStream",
-    "Finnhub", "FRED", "CoinGecko", "Polymarket", "UNHCR", "Cloudflare Radar",
-    "BGPStream", "GPSJam", "NOAA", "Copernicus", "IAEA", "Bloomberg",
-    "Reuters", "Al Jazeera", "Sky News", "Euronews", "DW News", "France 24",
-    "CNBC", "Nikkei", "Haaretz", "Al Arabiya", "TRT World",
-    "Defense One", "Jane's", "The War Zone", "Maritime Executive",
-    "OilPrice", "Rigzone", "Hellenic Shipping News",
+    "Finnhub", "FRED", "Bloomberg", "CNBC", "Nikkei", "CoinGecko", "Polymarket",
+    "Reuters", "ACLED", "UCDP", "GDELT", "NASA FIRMS", "USGS", "OpenSky", "AISStream",
+    "Cloudflare Radar", "BGPStream", "GPSJam", "NOAA", "Copernicus", "IAEA",
+    "Al Jazeera", "Sky News", "Euronews", "DW News", "France 24",
+    "OilPrice", "Rigzone", "Maritime Executive", "Hellenic Shipping News",
+    "Defense One", "Jane's", "The War Zone",
     "TechCrunch", "Ars Technica", "The Verge", "Wired",
     "Krebs on Security", "BleepingComputer", "The Record",
   ];
@@ -274,201 +717,83 @@ const SourceMarquee = () => {
   );
 };
 
-const SocialProof = () => (
-  <section className="border-y border-wm-border bg-wm-card/30 py-16 px-6">
-    <div className="max-w-5xl mx-auto">
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-8 text-center mb-12">
-        {[
-          { value: "2M+", label: "Unique visitors" },
-          { value: "216K", label: "Peak daily users" },
-          { value: "190+", label: "Countries reached" },
-          { value: "435+", label: "Live data sources" },
-        ].map((stat, i) => (
-          <div key={i}>
-            <p className="text-3xl md:text-4xl font-display font-bold text-wm-green">{stat.value}</p>
-            <p className="text-xs font-mono text-wm-muted uppercase tracking-widest mt-1">{stat.label}</p>
-          </div>
-        ))}
-      </div>
-      <blockquote className="max-w-3xl mx-auto text-center">
-        <p className="text-lg md:text-xl text-wm-muted italic leading-relaxed">
-          "The news became genuinely hard to parse. Iran, Trump's decisions, financial markets, critical minerals, tensions compounding from every direction simultaneously. I needed something that showed me how these events connect to each other in real time."
-        </p>
-        <footer className="mt-6 flex items-center justify-center gap-3">
-          <div className="text-sm">
-            <span className="text-wm-text font-bold">Elie Habib</span>
-            <span className="text-wm-muted"> — CEO of </span>
-            <a href="https://anghami.com" target="_blank" rel="noreferrer" className="text-wm-muted underline underline-offset-4 hover:text-wm-text transition-colors">Anghami</a>
-            <span className="text-wm-muted">, as told to </span>
-            <a href="https://www.wired.me/story/the-music-streaming-ceo-who-built-a-global-war-map" target="_blank" rel="noreferrer" className="text-wm-text underline underline-offset-4 hover:text-wm-green transition-colors">WIRED</a>
-          </div>
-        </footer>
-      </blockquote>
-    </div>
-  </section>
-);
-
-const DataCoverage = () => {
-  const domains = [
-    { icon: <Radio className="w-5 h-5" aria-hidden="true" />, name: "Geopolitical Events", desc: "ACLED & UCDP events with escalation scoring and trend analysis" },
-    { icon: <Plane className="w-5 h-5" aria-hidden="true" />, name: "Aviation Tracking", desc: "ADS-B transponder tracking of global flight patterns" },
-    { icon: <Ship className="w-5 h-5" aria-hidden="true" />, name: "Maritime & AIS", desc: "Ship movements, vessel detection, port and trade activity" },
-    { icon: <Flame className="w-5 h-5" aria-hidden="true" />, name: "Satellite Fire Detection", desc: "NASA FIRMS near-real-time fire and hotspot data" },
-    { icon: <Cable className="w-5 h-5" aria-hidden="true" />, name: "Submarine Cables", desc: "Undersea cable routes and landing stations" },
-    { icon: <Wifi className="w-5 h-5" aria-hidden="true" />, name: "Internet & GPS", desc: "Outage detection, BGP anomalies, GPS jamming zones" },
-    { icon: <MapPin className="w-5 h-5" aria-hidden="true" />, name: "Critical Infrastructure", desc: "Nuclear sites, power grids, pipelines, refineries" },
-    { icon: <TrendingUp className="w-5 h-5" aria-hidden="true" />, name: "Financial Markets", desc: "Equities, commodities, crypto, ETF flows, FRED macro data" },
-    { icon: <ShieldAlert className="w-5 h-5" aria-hidden="true" />, name: "Cyber Threats", desc: "Ransomware feeds, BGP hijacks, DDoS detection" },
-    { icon: <Globe className="w-5 h-5" aria-hidden="true" />, name: "GDELT & News", desc: "435+ RSS feeds, AI-scored GDELT events, live broadcasts" },
-    { icon: <Users className="w-5 h-5" aria-hidden="true" />, name: "Civil Unrest & Displacement", desc: "Protests, refugee flows, UNHCR displacement data" },
-    { icon: <Activity className="w-5 h-5" aria-hidden="true" />, name: "Seismology & Natural", desc: "USGS earthquakes, volcanic activity, severe weather" },
-  ];
-
-  return (
-    <section className="py-24 px-6" id="coverage">
-      <div className="max-w-7xl mx-auto">
-        <div className="text-center mb-16">
-          <h2 className="text-3xl md:text-5xl font-display font-bold mb-6">What World Monitor Tracks</h2>
-          <p className="text-wm-muted max-w-2xl mx-auto">
-            22 service domains ingested simultaneously. Everything normalized, geolocated, and rendered on a WebGL globe with thousands of markers.
-          </p>
-        </div>
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-          {domains.map((d, i) => (
-            <div key={i} className="bg-wm-card border border-wm-border p-4 hover:border-wm-green/30 transition-colors">
-              <div className="text-wm-green mb-3">{d.icon}</div>
-              <h3 className="font-bold text-sm mb-1">{d.name}</h3>
-              <p className="text-xs text-wm-muted">{d.desc}</p>
-            </div>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-};
-
-const Tiers = () => {
-  const tiers = [
-    {
-      name: "Free",
-      tagline: "See everything",
-      desc: "The open-source dashboard",
-      features: ["5-15 min refresh", "435+ feeds, 45 map layers", "BYOK for AI", "Free forever"],
-      color: "border-wm-border",
-      cta: { label: "Open Dashboard", href: "https://worldmonitor.app" }
-    },
-    {
-      name: "Pro",
-      tagline: "Know what matters",
-      desc: "The AI analyst",
-      features: ["Near-real-time (<60s)", "+ daily briefs, flash alerts", "AI included, 1 key", "Early access pricing"],
-      color: "border-wm-green",
-      glow: true,
-      cta: { label: "Join Waitlist", href: "#waitlist" }
-    },
-    {
-      name: "Enterprise",
-      tagline: "Act before anyone else",
-      desc: "The intelligence platform",
-      features: ["Live-edge + satellite", "+ AI agents, 50K+ infra points", "Custom AI, investor personas", "Contact us"],
-      color: "border-wm-border",
-      cta: { label: "Contact Sales", href: "mailto:enterprise@worldmonitor.app" }
-    }
-  ];
-
-  return (
-    <section className="py-24 px-6 max-w-7xl mx-auto" id="tiers">
-      <div className="grid md:grid-cols-3 gap-6">
-        {tiers.map((tier, i) => (
-          <div key={i} className={`bg-wm-card border ${tier.color} p-8 relative ${tier.glow ? 'border-glow' : ''}`}>
-            {tier.glow && <div className="absolute top-0 left-0 w-full h-1 bg-wm-green" />}
-            <h3 className="font-display text-2xl font-bold mb-2">{tier.name}</h3>
-            <p className="text-wm-muted font-mono text-sm mb-1">{tier.tagline}</p>
-            <p className="text-sm font-medium mb-8 pb-8 border-b border-wm-border">{tier.desc}</p>
-            <ul className="space-y-4 mb-8">
-              {tier.features.map((f, j) => (
-                <li key={j} className="flex items-start gap-3 text-sm">
-                  <Check className={`w-4 h-4 shrink-0 mt-0.5 ${tier.glow ? 'text-wm-green' : 'text-wm-muted'}`} aria-hidden="true" />
-                  <span className="text-wm-muted">{f}</span>
-                </li>
-              ))}
-            </ul>
-            <a
-              href={tier.cta.href}
-              className={`block text-center py-2.5 rounded-sm font-mono text-xs uppercase tracking-wider font-bold transition-colors ${
-                tier.glow
-                  ? 'bg-wm-green text-wm-bg hover:bg-green-400'
-                  : 'border border-wm-border text-wm-muted hover:text-wm-text hover:border-wm-text'
-              }`}
-            >
-              {tier.cta.label}
-            </a>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-};
-
+/* ─── 7. Pro Showcase + Slack Mock (current) ─── */
 const ProShowcase = () => (
   <section className="py-24 px-6 border-t border-wm-border bg-wm-card/30" id="pro">
     <div className="max-w-7xl mx-auto grid lg:grid-cols-2 gap-16 items-start">
       <div>
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-wm-green/30 bg-wm-green/10 text-wm-green text-xs font-mono mb-6">
-          PRO TIER
+          {t('proShowcase.proTier')}
         </div>
-        <h2 className="text-3xl md:text-5xl font-display font-bold mb-6">Your AI Analyst That Never Sleeps</h2>
+        <h2 className="text-3xl md:text-5xl font-display font-bold mb-6">{t('proShowcase.title')}</h2>
         <p className="text-wm-muted mb-8">
-          The free dashboard shows you the world. Pro tells you what it means — and makes sure you never miss what matters.
+          {t('proShowcase.subtitle')}
         </p>
 
         <div className="space-y-6">
           <div className="flex gap-4">
-            <Zap className="w-6 h-6 text-wm-green shrink-0" aria-hidden="true" />
+            <TrendingUp className="w-6 h-6 text-wm-green shrink-0" aria-hidden="true" />
             <div>
-              <h4 className="font-bold mb-1">Near-Real-Time Data</h4>
-              <p className="text-sm text-wm-muted">Refresh accelerated from 5-15 min to under 60 seconds. Priority pipeline for your alerts.</p>
+              <h3 className="font-bold mb-1">{t('proShowcase.equityResearch')}</h3>
+              <p className="text-sm text-wm-muted">{t('proShowcase.equityResearchDesc')}</p>
             </div>
           </div>
           <div className="flex gap-4">
-            <Brain className="w-6 h-6 text-wm-green shrink-0" aria-hidden="true" />
+            <Globe className="w-6 h-6 text-wm-green shrink-0" aria-hidden="true" />
             <div>
-              <h4 className="font-bold mb-1">"So What?" Analysis</h4>
-              <p className="text-sm text-wm-muted">Impact chains, pattern recognition, convergence detection, and market-geopolitical correlation.</p>
+              <h3 className="font-bold mb-1">{t('proShowcase.geopoliticalAnalysis')}</h3>
+              <p className="text-sm text-wm-muted">{t('proShowcase.geopoliticalAnalysisDesc')}</p>
+            </div>
+          </div>
+          <div className="flex gap-4">
+            <BarChart3 className="w-6 h-6 text-wm-green shrink-0" aria-hidden="true" />
+            <div>
+              <h3 className="font-bold mb-1">{t('proShowcase.economyAnalytics')}</h3>
+              <p className="text-sm text-wm-muted">{t('proShowcase.economyAnalyticsDesc')}</p>
+            </div>
+          </div>
+          <div className="flex gap-4">
+            <ShieldAlert className="w-6 h-6 text-wm-green shrink-0" aria-hidden="true" />
+            <div>
+              <h3 className="font-bold mb-1">{t('proShowcase.riskMonitoring')}</h3>
+              <p className="text-sm text-wm-muted">{t('proShowcase.riskMonitoringDesc')}</p>
+            </div>
+          </div>
+          <div className="flex gap-4">
+            <Telescope className="w-6 h-6 text-wm-green shrink-0" aria-hidden="true" />
+            <div>
+              <h4 className="font-bold mb-1">
+                {t('proShowcase.orbitalSurveillance')}
+                <SoonBadge />
+              </h4>
+              <p className="text-sm text-wm-muted">{t('proShowcase.orbitalSurveillanceDesc').replace(/^\(Soon\)\s*/, '')}</p>
             </div>
           </div>
           <div className="flex gap-4">
             <Clock className="w-6 h-6 text-wm-green shrink-0" aria-hidden="true" />
             <div>
-              <h4 className="font-bold mb-1">Morning Briefs & Flash Alerts</h4>
-              <p className="text-sm text-wm-muted">AI-synthesized overnight developments ranked by your focus areas. Breaking events pushed in real-time.</p>
-            </div>
-          </div>
-          <div className="flex gap-4">
-            <Bell className="w-6 h-6 text-wm-green shrink-0" aria-hidden="true" />
-            <div>
-              <h4 className="font-bold mb-1">Configurable Alerting</h4>
-              <p className="text-sm text-wm-muted">Set rules for CII deltas, convergence events, proximity to saved locations, and market correlation triggers.</p>
+              <h3 className="font-bold mb-1">{t('proShowcase.morningBriefs')}</h3>
+              <p className="text-sm text-wm-muted">{t('proShowcase.morningBriefsDesc')}</p>
             </div>
           </div>
           <div className="flex gap-4">
             <Key className="w-6 h-6 text-wm-green shrink-0" aria-hidden="true" />
             <div>
-              <h4 className="font-bold mb-1">22 Services, 1 Key</h4>
-              <p className="text-sm text-wm-muted">ACLED, UCDP, Finnhub, FRED, NASA FIRMS, AISStream, OpenSky, and more — all active, no separate registrations.</p>
+              <h3 className="font-bold mb-1">{t('proShowcase.oneKey')}</h3>
+              <p className="text-sm text-wm-muted">{t('proShowcase.oneKeyDesc')}</p>
             </div>
           </div>
         </div>
 
         <div className="mt-10 pt-8 border-t border-wm-border">
-          <p className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-4">Choose how intelligence finds you</p>
+          <p className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-4">{t('proShowcase.deliveryLabel')}</p>
           <div className="flex gap-6">
             {[
               { icon: <SlackIcon />, label: "Slack" },
-              { icon: <Send className="w-5 h-5" aria-hidden="true" />, label: "Telegram" },
-              { icon: <MessageCircle className="w-5 h-5" aria-hidden="true" />, label: "WhatsApp" },
-              { icon: <Mail className="w-5 h-5" aria-hidden="true" />, label: "Email" },
               { icon: <MessageSquare className="w-5 h-5" aria-hidden="true" />, label: "Discord" },
+              { icon: <Send className="w-5 h-5" aria-hidden="true" />, label: "Telegram" },
+              { icon: <Mail className="w-5 h-5" aria-hidden="true" />, label: "Email" },
+              { icon: <Plug className="w-5 h-5" aria-hidden="true" />, label: "Webhook" },
             ].map((ch, i) => (
               <div key={i} className="flex flex-col items-center gap-1.5 text-wm-muted hover:text-wm-text transition-colors cursor-pointer">
                 {ch.icon}
@@ -497,22 +822,22 @@ const ProShowcase = () => (
                 <span className="text-xs text-gray-500 bg-gray-800 px-1 rounded">APP</span>
                 <span className="text-xs text-gray-500">8:00 AM</span>
               </div>
-              <p className="text-gray-300 font-bold mb-3">Morning Brief &middot; Mar 6</p>
+              <p className="text-gray-300 font-bold mb-3">{t('slackMock.morningBrief')} &middot; Mar 6</p>
 
               <div className="space-y-3">
-                <div className="pl-3 border-l-2 border-red-500">
-                  <span className="text-red-400 font-bold text-xs uppercase tracking-wider">Critical</span>
-                  <p className="text-gray-300 mt-1">GPS jamming across 3 Baltic zones. Pattern matches prior infrastructure disruption signatures. NordBalt cable + Balticconnector in affected area.</p>
+                <div className="pl-3 border-l-2 border-blue-500">
+                  <span className="text-blue-400 font-bold text-xs uppercase tracking-wider">{t('slackMock.markets')}</span>
+                  <p className="text-gray-300 mt-1">{t('slackMock.marketsText')}</p>
                 </div>
 
                 <div className="pl-3 border-l-2 border-orange-500">
-                  <span className="text-orange-400 font-bold text-xs uppercase tracking-wider">Elevated</span>
-                  <p className="text-gray-300 mt-1">Pakistan CII 67&rarr;74. 12 new protest events (Lahore, Karachi, Islamabad). Last comparable spike preceded 2024 political crisis.</p>
+                  <span className="text-orange-400 font-bold text-xs uppercase tracking-wider">{t('slackMock.elevated')}</span>
+                  <p className="text-gray-300 mt-1">{t('slackMock.elevatedText')}</p>
                 </div>
 
                 <div className="pl-3 border-l-2 border-yellow-500">
-                  <span className="text-yellow-400 font-bold text-xs uppercase tracking-wider">Watch</span>
-                  <p className="text-gray-300 mt-1">Brent +2.3% on Hormuz AIS anomaly. 4 dark ships in 6h. IRGC exercise announced next week.</p>
+                  <span className="text-yellow-400 font-bold text-xs uppercase tracking-wider">{t('slackMock.watch')}</span>
+                  <p className="text-gray-300 mt-1">{t('slackMock.watchText')}</p>
                 </div>
               </div>
             </div>
@@ -523,6 +848,36 @@ const ProShowcase = () => (
   </section>
 );
 
+/* ─── 8. Audience Personas (new — from draft) ─── */
+const AudiencePersonas = () => {
+  const personas = [
+    { icon: <LineChart className="w-6 h-6" aria-hidden="true" />, title: t('audience.investorsTitle'), desc: t('audience.investorsDesc') },
+    { icon: <Fuel className="w-6 h-6" aria-hidden="true" />, title: t('audience.tradersTitle'), desc: t('audience.tradersDesc') },
+    { icon: <Search className="w-6 h-6" aria-hidden="true" />, title: t('audience.researchersTitle'), desc: t('audience.researchersDesc') },
+    { icon: <Globe className="w-6 h-6" aria-hidden="true" />, title: t('audience.journalistsTitle'), desc: t('audience.journalistsDesc') },
+    { icon: <Landmark className="w-6 h-6" aria-hidden="true" />, title: t('audience.govTitle'), desc: t('audience.govDesc') },
+    { icon: <Building2 className="w-6 h-6" aria-hidden="true" />, title: t('audience.teamsTitle'), desc: t('audience.teamsDesc') },
+  ];
+
+  return (
+    <section className="py-24 px-6">
+      <div className="max-w-5xl mx-auto">
+        <h2 className="text-3xl md:text-5xl font-display font-bold mb-16 text-center">{t('audience.title')}</h2>
+        <div className="grid md:grid-cols-3 gap-6">
+          {personas.map((p, i) => (
+            <div key={i} className="bg-wm-card border border-wm-border p-6 hover:border-wm-green/30 transition-colors">
+              <div className="text-wm-green mb-4">{p.icon}</div>
+              <h3 className="font-bold mb-2">{p.title}</h3>
+              <p className="text-sm text-wm-muted">{p.desc}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+};
+
+/* ─── 9. API Section (current) ─── */
 const ApiSection = () => (
   <section className="py-24 px-6 border-y border-wm-border bg-[#0a0a0a]" id="api">
     <div className="max-w-7xl mx-auto grid lg:grid-cols-2 gap-16 items-center">
@@ -555,145 +910,171 @@ const ApiSection = () => (
 
       <div className="order-1 lg:order-2">
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-wm-border bg-wm-card text-wm-muted text-xs font-mono mb-6">
-          API TIER
+          {t('apiSection.apiTier')}
         </div>
-        <h2 className="text-3xl md:text-5xl font-display font-bold mb-6">Programmatic Intelligence</h2>
+        <h2 className="text-3xl md:text-5xl font-display font-bold mb-6">{t('apiSection.title')}</h2>
         <p className="text-wm-muted mb-8">
-          For developers, analysts, and teams building on World Monitor data. Separate from Pro — use both or either.
+          {t('apiSection.subtitle')}
         </p>
         <ul className="space-y-4 mb-8">
           <li className="flex items-start gap-3">
             <Server className="w-5 h-5 text-wm-muted shrink-0" aria-hidden="true" />
-            <span className="text-sm">REST API across all 22 service domains</span>
+            <span className="text-sm">{t('apiSection.restApi')}</span>
           </li>
           <li className="flex items-start gap-3">
             <Lock className="w-5 h-5 text-wm-muted shrink-0" aria-hidden="true" />
-            <span className="text-sm">Authenticated per-key, rate-limited per tier</span>
+            <span className="text-sm">{t('apiSection.authenticated')}</span>
           </li>
           <li className="flex items-start gap-3">
             <Database className="w-5 h-5 text-wm-muted shrink-0" aria-hidden="true" />
-            <span className="text-sm">Structured JSON with cache headers and OpenAPI 3.1 docs</span>
+            <span className="text-sm">{t('apiSection.structured')}</span>
+          </li>
+          <li className="flex items-start gap-3">
+            <Terminal className="w-5 h-5 text-wm-muted shrink-0" aria-hidden="true" />
+            <span className="text-sm">
+              {t('apiSection.cli')}{' — '}
+              <a
+                href="https://www.npmjs.com/package/worldmonitor"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="font-mono text-wm-green hover:underline"
+              >
+                npx worldmonitor
+              </a>
+            </span>
           </li>
         </ul>
 
         <div className="grid grid-cols-2 gap-4 mb-8 p-4 bg-wm-card border border-wm-border rounded-sm">
           <div>
-            <p className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-2">Starter</p>
-            <p className="text-sm font-bold">1,000 req/day</p>
-            <p className="text-xs text-wm-muted">5 webhook rules</p>
+            <p className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-2">{t('apiSection.starter')}</p>
+            <p className="text-sm font-bold">{t('apiSection.starterReqs')}</p>
+            <p className="text-xs text-wm-muted">{t('apiSection.starterWebhooks')}</p>
           </div>
           <div>
-            <p className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-2">Business</p>
-            <p className="text-sm font-bold">50,000 req/day</p>
-            <p className="text-xs text-wm-muted">Unlimited webhooks + SLA</p>
+            <p className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-2">{t('apiSection.business')}</p>
+            <p className="text-sm font-bold">{t('apiSection.businessReqs')}</p>
+            <p className="text-xs text-wm-muted">{t('apiSection.businessWebhooks')}</p>
           </div>
         </div>
 
         <p className="text-sm text-wm-muted border-l-2 border-wm-border pl-4">
-          Feed data into your dashboards, automate alerting via Zapier/n8n/Make, build custom scoring models on CII/risk data.
+          {t('apiSection.feedData')}
         </p>
       </div>
     </div>
   </section>
 );
 
+/* ─── 10. Enterprise Showcase (current + enriched CTA) ─── */
 const EnterpriseShowcase = () => (
   <section className="py-24 px-6" id="enterprise">
     <div className="max-w-7xl mx-auto">
       <div className="text-center mb-16">
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-wm-border bg-wm-card text-wm-muted text-xs font-mono mb-6">
-          ENTERPRISE TIER
+          {t('enterpriseShowcase.enterpriseTier')}
         </div>
-        <h2 className="text-3xl md:text-5xl font-display font-bold mb-6">Intelligence Infrastructure</h2>
+        <h2 className="text-3xl md:text-5xl font-display font-bold mb-6">{t('enterpriseShowcase.title')}</h2>
         <p className="text-wm-muted max-w-2xl mx-auto">
-          For governments, institutions, trading desks, and organizations that need the full platform with maximum security, AI agents, and data depth.
+          {t('enterpriseShowcase.subtitle')}
         </p>
       </div>
 
       <div className="grid md:grid-cols-3 gap-6 mb-6">
         <div className="bg-wm-card border border-wm-border p-6">
           <ShieldAlert className="w-8 h-8 text-wm-muted mb-4" aria-hidden="true" />
-          <h4 className="font-bold mb-2">Government-Grade Security</h4>
-          <p className="text-sm text-wm-muted">Air-gapped deployment, on-premises Docker, dedicated cloud tenant, SOC 2 Type II path, SSO/MFA, and full audit trail.</p>
+          <h3 className="font-bold mb-2">{t('enterpriseShowcase.security')}</h3>
+          <p className="text-sm text-wm-muted">{t('enterpriseShowcase.securityDesc')}</p>
         </div>
         <div className="bg-wm-card border border-wm-border p-6">
           <Cpu className="w-8 h-8 text-wm-muted mb-4" aria-hidden="true" />
-          <h4 className="font-bold mb-2">AI Agents & MCP</h4>
-          <p className="text-sm text-wm-muted">Autonomous intelligence agents with investor personas. Connect World Monitor as a tool to Claude, GPT, or custom LLMs via MCP.</p>
+          <h3 className="font-bold mb-2">{t('enterpriseShowcase.aiAgents')}</h3>
+          <p className="text-sm text-wm-muted">{t('enterpriseShowcase.aiAgentsDesc')}</p>
         </div>
         <div className="bg-wm-card border border-wm-border p-6">
           <Layers className="w-8 h-8 text-wm-muted mb-4" aria-hidden="true" />
-          <h4 className="font-bold mb-2">Expanded Data Layers</h4>
-          <p className="text-sm text-wm-muted">Tens of thousands of infrastructure assets mapped globally. Satellite imagery integration with change detection and SAR.</p>
+          <h3 className="font-bold mb-2">{t('enterpriseShowcase.dataLayers')}</h3>
+          <p className="text-sm text-wm-muted">{t('enterpriseShowcase.dataLayersDesc')}</p>
         </div>
       </div>
       <div className="grid md:grid-cols-3 gap-6 mb-12">
         <div className="bg-wm-card border border-wm-border p-6">
           <Plug className="w-8 h-8 text-wm-muted mb-4" aria-hidden="true" />
-          <h4 className="font-bold mb-2">100+ Data Connectors</h4>
-          <p className="text-sm text-wm-muted">PostgreSQL, Snowflake, Splunk, Sentinel, Jira, Slack, Teams, and more. Export to PDF, PowerPoint, CSV, GeoJSON.</p>
+          <h3 className="font-bold mb-2">{t('enterpriseShowcase.connectors')}</h3>
+          <p className="text-sm text-wm-muted">{t('enterpriseShowcase.connectorsDesc')}</p>
         </div>
         <div className="bg-wm-card border border-wm-border p-6">
           <PanelTop className="w-8 h-8 text-wm-muted mb-4" aria-hidden="true" />
-          <h4 className="font-bold mb-2">White-Label & Embeddable</h4>
-          <p className="text-sm text-wm-muted">Your brand, your domain, your desktop app. Embeddable iframe panels for SOC walls and trading floors.</p>
+          <h3 className="font-bold mb-2">{t('enterpriseShowcase.whiteLabel')}</h3>
+          <p className="text-sm text-wm-muted">{t('enterpriseShowcase.whiteLabelDesc')}</p>
         </div>
         <div className="bg-wm-card border border-wm-border p-6">
           <BarChart3 className="w-8 h-8 text-wm-muted mb-4" aria-hidden="true" />
-          <h4 className="font-bold mb-2">Financial Intelligence</h4>
-          <p className="text-sm text-wm-muted">Earnings calendar, energy grid data, enhanced commodity tracking with cargo inference, sanctions screening with AIS correlation.</p>
+          <h3 className="font-bold mb-2">{t('enterpriseShowcase.financial')}</h3>
+          <p className="text-sm text-wm-muted">{t('enterpriseShowcase.financialDesc')}</p>
         </div>
       </div>
 
-      <div className="data-grid">
+      <div className="data-grid mb-12">
         <div className="data-cell">
-          <h5 className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-2">Commodity Trading</h5>
-          <p className="text-sm">Vessel tracking + cargo inference + supply chain graph. Know before the market moves.</p>
+          <h4 className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-2">{t('enterpriseShowcase.commodity')}</h4>
+          <p className="text-sm">{t('enterpriseShowcase.commodityDesc')}</p>
         </div>
         <div className="data-cell">
-          <h5 className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-2">Government & Institutions</h5>
-          <p className="text-sm">Air-gapped, AI agents, full situational awareness, MCP. No data leaves your network.</p>
+          <h4 className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-2">{t('enterpriseShowcase.government')}</h4>
+          <p className="text-sm">{t('enterpriseShowcase.governmentDesc')}</p>
         </div>
         <div className="data-cell">
-          <h5 className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-2">Risk Consultancies</h5>
-          <p className="text-sm">Scenario simulation, investor personas, branded PDF/PowerPoint reports on demand.</p>
+          <h4 className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-2">{t('enterpriseShowcase.risk')}</h4>
+          <p className="text-sm">{t('enterpriseShowcase.riskDesc')}</p>
         </div>
         <div className="data-cell">
-          <h5 className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-2">SOCs & CERT</h5>
-          <p className="text-sm">Cyber threat layer, SIEM integration, BGP anomaly monitoring, ransomware feeds.</p>
+          <h4 className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-2">{t('enterpriseShowcase.soc')}</h4>
+          <p className="text-sm">{t('enterpriseShowcase.socDesc')}</p>
         </div>
+      </div>
+
+      <div className="text-center mt-12">
+        <a
+          href="#enterprise-contact"
+          aria-label="Talk to sales about Enterprise plans"
+          className="inline-flex items-center gap-2 bg-wm-green text-wm-bg px-8 py-3 rounded-sm font-mono text-sm uppercase tracking-wider font-bold hover:bg-green-400 transition-colors"
+        >
+          {t('enterpriseShowcase.talkToSales')} <ArrowRight className="w-4 h-4" aria-hidden="true" />
+        </a>
       </div>
     </div>
   </section>
 );
 
+/* ─── 11. Comparison Table (simplified columns, kept technical rows) ─── */
 const PricingTable = () => {
   const rows = [
-    { feature: "Data refresh", free: "5-15 min", pro: "<60 seconds", api: "Per-request", ent: "Live-edge" },
-    { feature: "Dashboard", free: "50+ panels", pro: "50+ panels", api: "\u2014", ent: "White-label" },
-    { feature: "AI", free: "BYOK", pro: "Included", api: "\u2014", ent: "Agents + personas" },
-    { feature: "Briefs & alerts", free: "\u2014", pro: "Daily + flash", api: "\u2014", ent: "Team distribution" },
-    { feature: "Delivery", free: "\u2014", pro: "Slack/TG/WA/Email", api: "Webhook", ent: "+ SIEM/MCP" },
-    { feature: "API", free: "\u2014", pro: "\u2014", api: "REST + webhook", ent: "+ MCP + bulk" },
-    { feature: "Infrastructure layers", free: "45", pro: "45", api: "\u2014", ent: "+ tens of thousands" },
-    { feature: "Satellite", free: "\u2014", pro: "\u2014", api: "\u2014", ent: "Imagery + SAR" },
-    { feature: "Connectors", free: "\u2014", pro: "\u2014", api: "\u2014", ent: "100+" },
-    { feature: "Deployment", free: "Cloud", pro: "Cloud", api: "Cloud", ent: "Cloud/on-prem/air-gap" },
-    { feature: "Security", free: "Standard", pro: "Standard", api: "Key auth", ent: "SSO/MFA/RBAC/audit" },
+    { feature: t('pricingTable.dataRefresh'), free: t('pricingTable.f5_15min'), pro: t('pricingTable.fLt60s'), api: t('pricingTable.fPerRequest'), ent: t('pricingTable.fLiveEdge') },
+    { feature: t('pricingTable.dashboard'), free: t('pricingTable.f50panels'), pro: t('pricingTable.f50panels'), api: "\u2014", ent: t('pricingTable.fWhiteLabel') },
+    { feature: t('pricingTable.ai'), free: t('pricingTable.fBYOK'), pro: t('pricingTable.fIncluded'), api: "\u2014", ent: t('pricingTable.fAgentsPersonas') },
+    { feature: t('pricingTable.briefsAlerts'), free: "\u2014", pro: t('pricingTable.fDailyFlash'), api: "\u2014", ent: t('pricingTable.fTeamDist') },
+    { feature: t('pricingTable.delivery'), free: "\u2014", pro: t('pricingTable.fSlackTgWa'), api: t('pricingTable.fWebhook'), ent: t('pricingTable.fSiemMcp') },
+    { feature: t('pricingTable.apiRow'), free: "\u2014", pro: "\u2014", api: t('pricingTable.fRestWebhook'), ent: t('pricingTable.fMcpBulk') },
+    { feature: t('pricingTable.infraLayers'), free: t('pricingTable.f50plus'), pro: t('pricingTable.f50plus'), api: "\u2014", ent: t('pricingTable.fTensOfThousands') },
+    { feature: t('pricingTable.satellite'), free: t('pricingTable.fLiveTracking'), pro: t('pricingTable.fPassAlerts'), api: "\u2014", ent: t('pricingTable.fImagerySar') },
+    { feature: t('pricingTable.connectorsRow'), free: "\u2014", pro: "\u2014", api: "\u2014", ent: t('pricingTable.f100plus') },
+    { feature: t('pricingTable.deployment'), free: t('pricingTable.fCloud'), pro: t('pricingTable.fCloud'), api: t('pricingTable.fCloud'), ent: t('pricingTable.fCloudOnPrem') },
+    { feature: t('pricingTable.securityRow'), free: t('pricingTable.fStandard'), pro: t('pricingTable.fStandard'), api: t('pricingTable.fKeyAuth'), ent: t('pricingTable.fSsoMfa') },
   ];
 
   return (
     <section className="py-24 px-6 max-w-7xl mx-auto">
       <div className="text-center mb-16">
-        <h2 className="text-3xl md:text-5xl font-display font-bold mb-6">Compare Tiers</h2>
+        <h2 className="text-3xl md:text-5xl font-display font-bold mb-6">{t('pricingTable.title')}</h2>
       </div>
       <div className="hidden md:block">
         <div className="grid grid-cols-5 gap-4 mb-4 pb-4 border-b border-wm-border font-mono text-xs uppercase tracking-widest text-wm-muted">
-          <div>Feature</div>
-          <div>Free ($0)</div>
-          <div className="text-wm-green">Pro (Early Access)</div>
-          <div>API (Coming Soon)</div>
-          <div>Enterprise (Contact)</div>
+          <div>{t('pricingTable.feature')}</div>
+          <div>{t('pricingTable.freeHeader')}</div>
+          <div className="text-wm-green">{t('pricingTable.proHeader')}</div>
+          <div>{t('pricingTable.apiHeader')}</div>
+          <div>{t('pricingTable.entHeader')}</div>
         </div>
         {rows.map((row, i) => (
           <div key={i} className="grid grid-cols-5 gap-4 py-4 border-b border-wm-border/50 text-sm hover:bg-wm-card/50 transition-colors">
@@ -710,31 +1091,42 @@ const PricingTable = () => {
           <div key={i} className="bg-wm-card border border-wm-border p-4 rounded-sm">
             <p className="font-medium text-sm mb-3">{row.feature}</p>
             <div className="grid grid-cols-2 gap-2 text-xs">
-              <div><span className="text-wm-muted">Free:</span> {row.free}</div>
-              <div><span className="text-wm-green">Pro:</span> <span className="text-wm-green">{row.pro}</span></div>
-              <div><span className="text-wm-muted">API:</span> {row.api}</div>
-              <div><span className="text-wm-muted">Ent:</span> {row.ent}</div>
+              <div><span className="text-wm-muted">{t('tiers.free')}:</span> {row.free}</div>
+              <div><span className="text-wm-green">{t('tiers.pro')}:</span> <span className="text-wm-green">{row.pro}</span></div>
+              <div><span className="text-wm-muted">{t('nav.api')}:</span> {row.api}</div>
+              <div><span className="text-wm-muted">{t('tiers.enterprise')}:</span> {row.ent}</div>
             </div>
           </div>
         ))}
       </div>
+      <p className="text-center text-sm text-wm-muted mt-8">
+        {t('pricingTable.noteBelow')}
+      </p>
     </section>
   );
 };
 
+/* ─── 12. FAQ (draft copy — warmer tone) ─── */
 const FAQ = () => {
   const faqs = [
-    { q: "Is the free version going away?", a: "No. The free dashboard stays free forever. Pro adds AI intelligence, alerts, and delivery channels on top of the same dashboard you use today.", open: true },
-    { q: "Can I still use my own API keys?", a: "Yes. Bring-your-own-keys always works. Pro simply means you don't have to register for 20+ separate services." },
-    { q: "What's the difference between API and Pro?", a: "Pro delivers AI briefs and alerts to Slack, Telegram, WhatsApp, and email. API gives you programmatic REST access for your own code. They're independent tiers — use both or either." },
-    { q: "What's MCP?", a: "Model Context Protocol lets AI agents (Claude, GPT, or custom LLMs) use World Monitor as a tool — querying all 22 services, reading map state, and triggering analysis. Enterprise only." },
-    { q: "Can we deploy on-premises?", a: "Enterprise includes Docker deployment, air-gapped mode with local Ollama AI, zero external network calls, full audit logging, and data residency options (EU, US, MENA)." },
-    { q: "How fast is near-real-time?", a: "Pro data refreshes under 60 seconds with priority pipeline. Free tier refreshes every 5-15 minutes. Enterprise gets live-edge streaming for critical event types." }
+    { q: t('faq.q1'), a: t('faq.a1'), open: true },
+    { q: t('faq.q2'), a: t('faq.a2') },
+    { q: t('faq.q3'), a: t('faq.a3') },
+    { q: t('faq.q4'), a: t('faq.a4') },
+    { q: t('faq.q5'), a: t('faq.a5') },
+    { q: t('faq.q6'), a: t('faq.a6') },
+    { q: t('faq.q7'), a: t('faq.a7') },
+    { q: t('faq.q8'), a: t('faq.a8') },
+    { q: t('faq.q9'), a: t('faq.a9') },
+    { q: t('faq.q10'), a: t('faq.a10') },
+    { q: t('faq.q11'), a: t('faq.a11') },
+    { q: t('faq.q12'), a: t('faq.a12') },
+    { q: t('faq.q13'), a: t('faq.a13') },
   ];
 
   return (
     <section className="py-24 px-6 max-w-3xl mx-auto">
-      <h2 className="text-3xl font-display font-bold mb-12 text-center">Frequently Asked Questions</h2>
+      <h2 className="text-3xl font-display font-bold mb-12 text-center">{t('faq.title')}</h2>
       <div className="space-y-4">
         {faqs.map((faq, i) => (
           <details key={i} open={faq.open} className="group bg-wm-card border border-wm-border rounded-sm [&_summary::-webkit-details-marker]:hidden">
@@ -752,63 +1144,301 @@ const FAQ = () => {
   );
 };
 
-const Footer = () => (
-  <footer className="border-t border-wm-border bg-[#020202] pt-24 pb-12 px-6 text-center" id="waitlist">
-    <div className="max-w-2xl mx-auto mb-16">
-      <h2 className="text-4xl font-display font-bold mb-6">Be first in line.</h2>
-      <form className="flex flex-col gap-3 max-w-md mx-auto mb-6" onSubmit={(e) => { e.preventDefault(); const form = e.currentTarget; const email = new FormData(form).get('email') as string; submitWaitlist(email, form); }}>
-        <input type="text" name="website" autoComplete="off" tabIndex={-1} aria-hidden="true" className="absolute opacity-0 h-0 w-0 pointer-events-none" />
-        <div className="flex flex-col sm:flex-row gap-3">
-          <input
-            type="email"
-            name="email"
-            placeholder="Enter your email"
-            className="flex-1 bg-wm-card border border-wm-border rounded-sm px-4 py-3 text-sm focus:outline-none focus:border-wm-green transition-colors font-mono"
-            required
-            aria-label="Email address for waitlist"
-          />
-          <button type="submit" className="bg-wm-green text-wm-bg px-6 py-3 rounded-sm font-mono text-sm uppercase tracking-wider font-bold hover:bg-green-400 transition-colors whitespace-nowrap">
-            Join Waitlist
-          </button>
+/* ─── Enterprise Page (dedicated /pro/#enterprise) ─── */
+const EnterprisePage = () => (
+  <div className="min-h-screen selection:bg-wm-green/30 selection:text-wm-green">
+    <nav className="fixed top-0 left-0 right-0 z-50 glass-panel border-b-0 border-x-0 rounded-none" aria-label="Main navigation">
+      <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
+        <a href="#" onClick={(e) => { e.preventDefault(); window.location.hash = ''; }}><Logo /></a>
+        <div className="hidden md:flex items-center gap-8 text-sm font-mono text-wm-muted">
+          <a href="#" onClick={(e) => { e.preventDefault(); window.location.hash = ''; }} className="hover:text-wm-text transition-colors">{t('nav.pro')}</a>
+          <a href="#enterprise" onClick={(e) => { e.preventDefault(); document.getElementById('features')?.scrollIntoView({ behavior: 'smooth' }); }} className="hover:text-wm-text transition-colors">{t('nav.enterprise')}</a>
+          <a href="#enterprise-contact" onClick={(e) => { e.preventDefault(); document.getElementById('contact')?.scrollIntoView({ behavior: 'smooth' }); }} className="hover:text-wm-green transition-colors">{t('enterpriseShowcase.talkToSales')}</a>
         </div>
-        <div className="cf-turnstile mx-auto" data-sitekey={TURNSTILE_SITE_KEY} data-theme="dark" data-size="compact" />
-      </form>
-      <p className="text-sm text-wm-muted">
-        Looking for Enterprise? <a href="mailto:enterprise@worldmonitor.app" className="text-wm-text underline underline-offset-4 hover:text-wm-green transition-colors">Contact us</a>.
-      </p>
-    </div>
+        <a href="#enterprise-contact" onClick={(e) => { e.preventDefault(); document.getElementById('contact')?.scrollIntoView({ behavior: 'smooth' }); }} className="bg-wm-green text-wm-bg px-4 py-2 rounded-sm font-mono text-xs uppercase tracking-wider font-bold hover:bg-green-400 transition-colors">
+          {t('enterpriseShowcase.talkToSales')}
+        </a>
+      </div>
+    </nav>
 
-    <div className="flex flex-col md:flex-row items-center justify-between max-w-7xl mx-auto pt-8 border-t border-wm-border/50 text-xs text-wm-muted font-mono">
-      <div className="flex items-center gap-4 mb-4 md:mb-0">
-        <Logo />
+    <main className="pt-24">
+      {/* Hero */}
+      <section className="py-24 px-6 text-center">
+        <div className="max-w-4xl mx-auto">
+          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-wm-border bg-wm-card text-wm-muted text-xs font-mono mb-6">
+            {t('enterpriseShowcase.enterpriseTier')}
+          </div>
+          <h2 className="text-4xl md:text-6xl font-display font-bold mb-6">{t('enterpriseShowcase.title')}</h2>
+          <p className="text-lg text-wm-muted max-w-2xl mx-auto mb-10">
+            {t('enterpriseShowcase.subtitle')}
+          </p>
+          <a href="#enterprise-contact" onClick={(e) => { e.preventDefault(); document.getElementById('contact')?.scrollIntoView({ behavior: 'smooth' }); }} className="inline-flex items-center gap-2 bg-wm-green text-wm-bg px-8 py-3 rounded-sm font-mono text-sm uppercase tracking-wider font-bold hover:bg-green-400 transition-colors">
+            {t('enterpriseShowcase.talkToSales')} <ArrowRight className="w-4 h-4" aria-hidden="true" />
+          </a>
+        </div>
+      </section>
+
+      {/* Features grid */}
+      <section className="py-24 px-6" id="features">
+        <div className="max-w-7xl mx-auto">
+          <h2 className="sr-only">Enterprise Features</h2>
+          <div className="grid md:grid-cols-3 gap-6 mb-6">
+            <div className="bg-wm-card border border-wm-border p-6">
+              <ShieldAlert className="w-8 h-8 text-wm-muted mb-4" aria-hidden="true" />
+              <h3 className="font-bold mb-2">{t('enterpriseShowcase.security')}</h3>
+              <p className="text-sm text-wm-muted">{t('enterpriseShowcase.securityDesc')}</p>
+            </div>
+            <div className="bg-wm-card border border-wm-border p-6">
+              <Cpu className="w-8 h-8 text-wm-muted mb-4" aria-hidden="true" />
+              <h3 className="font-bold mb-2">{t('enterpriseShowcase.aiAgents')}</h3>
+              <p className="text-sm text-wm-muted">{t('enterpriseShowcase.aiAgentsDesc')}</p>
+            </div>
+            <div className="bg-wm-card border border-wm-border p-6">
+              <Layers className="w-8 h-8 text-wm-muted mb-4" aria-hidden="true" />
+              <h3 className="font-bold mb-2">{t('enterpriseShowcase.dataLayers')}</h3>
+              <p className="text-sm text-wm-muted">{t('enterpriseShowcase.dataLayersDesc')}</p>
+            </div>
+          </div>
+          <div className="grid md:grid-cols-3 gap-6 mb-12">
+            <div className="bg-wm-card border border-wm-border p-6">
+              <Plug className="w-8 h-8 text-wm-muted mb-4" aria-hidden="true" />
+              <h3 className="font-bold mb-2">{t('enterpriseShowcase.connectors')}</h3>
+              <p className="text-sm text-wm-muted">{t('enterpriseShowcase.connectorsDesc')}</p>
+            </div>
+            <div className="bg-wm-card border border-wm-border p-6">
+              <PanelTop className="w-8 h-8 text-wm-muted mb-4" aria-hidden="true" />
+              <h3 className="font-bold mb-2">{t('enterpriseShowcase.whiteLabel')}</h3>
+              <p className="text-sm text-wm-muted">{t('enterpriseShowcase.whiteLabelDesc')}</p>
+            </div>
+            <div className="bg-wm-card border border-wm-border p-6">
+              <BarChart3 className="w-8 h-8 text-wm-muted mb-4" aria-hidden="true" />
+              <h3 className="font-bold mb-2">{t('enterpriseShowcase.financial')}</h3>
+              <p className="text-sm text-wm-muted">{t('enterpriseShowcase.financialDesc')}</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Use cases */}
+      <section className="py-24 px-6 border-t border-wm-border">
+        <div className="max-w-7xl mx-auto">
+          <h2 className="text-3xl font-display font-bold mb-12 text-center">{t('enterpriseShowcase.title')}</h2>
+          <div className="data-grid">
+            <div className="data-cell">
+              <h3 className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-2">{t('enterpriseShowcase.commodity')}</h3>
+              <p className="text-sm">{t('enterpriseShowcase.commodityDesc')}</p>
+            </div>
+            <div className="data-cell">
+              <h3 className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-2">{t('enterpriseShowcase.government')}</h3>
+              <p className="text-sm">{t('enterpriseShowcase.governmentDesc')}</p>
+            </div>
+            <div className="data-cell">
+              <h3 className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-2">{t('enterpriseShowcase.risk')}</h3>
+              <p className="text-sm">{t('enterpriseShowcase.riskDesc')}</p>
+            </div>
+            <div className="data-cell">
+              <h3 className="font-mono text-xs text-wm-muted uppercase tracking-widest mb-2">{t('enterpriseShowcase.soc')}</h3>
+              <p className="text-sm">{t('enterpriseShowcase.socDesc')}</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Contact form */}
+      <section className="py-24 px-6 border-t border-wm-border" id="contact">
+        <div className="max-w-xl mx-auto">
+          <h2 className="font-display text-3xl font-bold mb-2 text-center">{t('enterpriseShowcase.contactFormTitle')}</h2>
+          <p className="text-sm text-wm-muted mb-10 text-center">{t('enterpriseShowcase.contactFormSubtitle')}</p>
+          <form className="space-y-4" onSubmit={async (e) => {
+            e.preventDefault();
+            const form = e.currentTarget;
+            const btn = form.querySelector('button[type="submit"]') as HTMLButtonElement;
+            const origText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = t('enterpriseShowcase.contactSending');
+            const fd = new FormData(form);
+            const honeypot = (form.querySelector('input[name="website"]') as HTMLInputElement)?.value || '';
+            const turnstileWidget = form.querySelector('.cf-turnstile') as HTMLElement | null;
+            let turnstileToken = turnstileWidget?.dataset.token || '';
+            if (!turnstileToken && turnstileWidget) {
+              // Turnstile loads lazily (viewport-triggered), so a fast or
+              // autofilled submit can arrive before the widget produced a
+              // token. Kick the loader and give the challenge a bounded
+              // window; if it still hasn't resolved, POST anyway — the
+              // server verdict (and the existing failure UX + widget
+              // reset) stays the authority, same as an expired token.
+              if (await ensureTurnstileScript()) renderTurnstileWidgets();
+              for (let i = 0; i < 40 && !turnstileWidget.dataset.token; i++) {
+                await new Promise((resolve) => setTimeout(resolve, 250));
+              }
+              turnstileToken = turnstileWidget.dataset.token || '';
+            }
+            try {
+              const res = await fetch(`${API_BASE}/leads/v1/submit-contact`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  email: fd.get('email'),
+                  name: fd.get('name'),
+                  organization: fd.get('organization'),
+                  phone: fd.get('phone'),
+                  message: fd.get('message'),
+                  source: 'enterprise-contact',
+                  website: honeypot,
+                  turnstileToken,
+                }),
+              });
+              const errorEl = form.querySelector('[data-form-error]') as HTMLElement | null;
+              if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                if (res.status === 422 && errorEl) {
+                  errorEl.textContent = data.message || data.error || t('enterpriseShowcase.workEmailRequired');
+                  errorEl.classList.remove('hidden');
+                  btn.textContent = origText;
+                  btn.disabled = false;
+                  return;
+                }
+                throw new Error();
+              }
+              if (errorEl) errorEl.classList.add('hidden');
+              btn.textContent = t('enterpriseShowcase.contactSent');
+              btn.className = btn.className.replace('bg-wm-green', 'bg-wm-card border border-wm-green text-wm-green');
+            } catch {
+              btn.textContent = t('enterpriseShowcase.contactFailed');
+              btn.disabled = false;
+              if (turnstileWidget?.dataset.widgetId && window.turnstile) {
+                window.turnstile.reset(turnstileWidget.dataset.widgetId);
+                delete turnstileWidget.dataset.token;
+              }
+              setTimeout(() => { btn.textContent = origText; }, 4000);
+            }
+          }}>
+            <input type="text" name="website" autoComplete="off" tabIndex={-1} aria-hidden="true" className="absolute opacity-0 h-0 w-0 pointer-events-none" />
+            <div className="grid grid-cols-2 gap-4">
+              <input type="text" name="name" placeholder={t('enterpriseShowcase.namePlaceholder')} required className="bg-wm-bg border border-wm-border rounded-sm px-4 py-3 text-sm focus:outline-none focus:border-wm-green transition-colors font-mono" />
+              <input type="email" name="email" placeholder={t('enterpriseShowcase.emailPlaceholder')} required className="bg-wm-bg border border-wm-border rounded-sm px-4 py-3 text-sm focus:outline-none focus:border-wm-green transition-colors font-mono" />
+            </div>
+            <span data-form-error className="hidden text-red-400 text-xs font-mono block" />
+            <div className="grid grid-cols-2 gap-4">
+              <input type="text" name="organization" placeholder={t('enterpriseShowcase.orgPlaceholder')} required className="bg-wm-bg border border-wm-border rounded-sm px-4 py-3 text-sm focus:outline-none focus:border-wm-green transition-colors font-mono" />
+              <input type="tel" name="phone" placeholder={t('enterpriseShowcase.phonePlaceholder')} required className="bg-wm-bg border border-wm-border rounded-sm px-4 py-3 text-sm focus:outline-none focus:border-wm-green transition-colors font-mono" />
+            </div>
+            <textarea name="message" placeholder={t('enterpriseShowcase.messagePlaceholder')} rows={4} className="w-full bg-wm-bg border border-wm-border rounded-sm px-4 py-3 text-sm focus:outline-none focus:border-wm-green transition-colors font-mono resize-none" />
+            <div className="cf-turnstile mx-auto" />
+            <button type="submit" className="w-full bg-wm-green text-wm-bg py-3 rounded-sm font-mono text-sm uppercase tracking-wider font-bold hover:bg-green-400 transition-colors">
+              {t('enterpriseShowcase.submitContact')}
+            </button>
+          </form>
+        </div>
+      </section>
+    </main>
+
+    {/* Footer */}
+    <footer className="border-t border-wm-border bg-[#020202] py-8 px-6 text-center">
+      <div className="flex flex-col md:flex-row items-center justify-between max-w-7xl mx-auto text-xs text-wm-muted font-mono">
+        <div className="flex items-center gap-3 mb-4 md:mb-0">
+          <img src="/favico/favicon-32x32.png" alt="" width="28" height="28" loading="lazy" className="rounded-full" />
+          <div className="flex flex-col">
+            <span className="font-display font-bold text-sm leading-none tracking-tight text-wm-text">WORLD MONITOR</span>
+            <span className="text-[9px] uppercase tracking-[2px] opacity-60 mt-0.5">by Someone.ceo</span>
+          </div>
+        </div>
+        <div className="flex items-center gap-6">
+          <a href={DASHBOARD_PATH} className="hover:text-wm-text transition-colors">Dashboard</a>
+          <a href="https://www.worldmonitor.app/blog/" className="hover:text-wm-text transition-colors">Blog</a>
+          <a href="https://www.worldmonitor.app/docs" className="hover:text-wm-text transition-colors">Docs</a>
+          <a href="https://status.worldmonitor.app/" target="_blank" rel="noreferrer" className="hover:text-wm-text transition-colors">Status</a>
+          <a href="https://github.com/koala73/worldmonitor" target="_blank" rel="noreferrer" className="hover:text-wm-text transition-colors">GitHub</a>
+          <a href="https://discord.gg/re63kWKxaz" target="_blank" rel="noreferrer" className="hover:text-wm-text transition-colors">Discord</a>
+          <a href="https://x.com/worldmonitorai" target="_blank" rel="noreferrer" className="hover:text-wm-text transition-colors">X</a>
+        </div>
+        <span className="text-[10px] opacity-40 mt-4 md:mt-0">&copy; {new Date().getFullYear()} WorldMonitor</span>
       </div>
-      <div className="flex gap-6">
-        <a href="https://x.com/eliehabib" target="_blank" rel="noreferrer" className="hover:text-wm-text transition-colors">X</a>
-        <a href="https://github.com/koala73/worldmonitor" target="_blank" rel="noreferrer" className="hover:text-wm-text transition-colors">GitHub</a>
-        <a href="https://www.wired.me/story/the-music-streaming-ceo-who-built-a-global-war-map" target="_blank" rel="noreferrer" className="hover:text-wm-text transition-colors">WIRED Article</a>
-      </div>
-    </div>
-  </footer>
+    </footer>
+  </div>
 );
 
+/* ─── Page Layout ─── */
 export default function App() {
+  const [page, setPage] = useState(() => window.location.hash.startsWith('#enterprise') ? 'enterprise' : 'home');
+
+  // Initialize Dodo checkout overlay with success handler.
+  //
+  // On overlay success, the buyer needs to be bridged from /pro to the
+  // main dashboard where their newly-minted entitlement actually
+  // unlocks panels. Two changes vs the original 3-second blind reload:
+  //
+  //   1. Explicit "Go to dashboard now →" button so engaged buyers
+  //      don't wait out the auto-redirect timer.
+  //   2. Auto-redirect is 1500ms (down from 3000ms) — fast enough to
+  //      feel responsive without clipping the confirmation reading time.
+  //   3. Redirect target carries `?wm_checkout=success` so the dashboard
+  //      side (handleCheckoutReturn in src/services/checkout-return.ts)
+  //      recognizes this as a post-purchase landing and triggers the
+  //      extended-unlock banner from PR-4, instead of rendering a
+  //      default dashboard with no context.
+  useEffect(() => {
+    // #4449: the Dodo overlay is no longer used — checkout redirects top-level
+    // to the hosted page (see startCheckout). We no longer call initOverlay(),
+    // which dynamically imported the heavy Dodo overlay SDK on /pro mount and
+    // registered a success banner that can never fire (after payment the buyer
+    // lands on the dashboard, not /pro — handleCheckoutReturn owns that UX).
+    // Consume checkout intent from URL (set by afterSignInUrl on the
+    // checkout-initiated sign-in). No-op for any other /pro entry
+    // point; strips params before any await so a reload can't re-fire.
+    void tryResumeCheckoutFromUrl();
+  }, []);
+
+  useEffect(() => {
+    const onHash = () => {
+      const hash = window.location.hash;
+      const next = hash.startsWith('#enterprise') ? 'enterprise' : 'home';
+      const wasEnterprise = page === 'enterprise';
+      setPage(next);
+      if (next === 'enterprise' && !wasEnterprise) window.scrollTo(0, 0);
+      if (hash === '#enterprise-contact') {
+        setTimeout(() => {
+          document.getElementById('contact')?.scrollIntoView({ behavior: 'smooth' });
+        }, wasEnterprise ? 0 : 100);
+      }
+    };
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, [page]);
+
+  useEffect(() => {
+    if (page === 'enterprise' && window.location.hash === '#enterprise-contact') {
+      setTimeout(() => {
+        document.getElementById('contact')?.scrollIntoView({ behavior: 'smooth' });
+      }, 100);
+    }
+  }, []);
+
+  if (page === 'enterprise') return <EnterprisePage />;
+
   return (
-    <div className="min-h-screen selection:bg-wm-green/30 selection:text-wm-green">
-      <Navbar />
-      <main>
-        <Hero />
-        <LivePreview />
-        <SourceMarquee />
-        <SocialProof />
-        <DataCoverage />
-        <Tiers />
-        <ProShowcase />
-        <ApiSection />
-        <EnterpriseShowcase />
-        <PricingTable />
-        <FAQ />
-      </main>
-      <Footer />
-    </div>
+    <ProEntitlementProvider>
+      <div className="min-h-screen selection:bg-wm-green/30 selection:text-wm-green">
+        <Navbar />
+        <main>
+          <Hero />
+          <SourceMarquee />
+          <Pillars />
+          <WhyUpgrade />
+          <TwoPathSplit />
+          <ProShowcase />
+          <DeliveryDesk />
+          <AudiencePersonas />
+          <SocialProof />
+          <LivePreview />
+          <PricingSection refCode={getRefCode()} />
+          <PricingTable />
+          <ApiSection />
+          <EnterpriseShowcase />
+          <FAQ />
+        </main>
+        <Footer />
+      </div>
+    </ProEntitlementProvider>
   );
 }

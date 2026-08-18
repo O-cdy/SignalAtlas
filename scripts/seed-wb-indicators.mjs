@@ -10,11 +10,9 @@
  *   node scripts/seed-wb-indicators.mjs [--env production|preview|development] [--sha <sha>]
  */
 
-import { readFileSync, existsSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
+import { loadEnvFile } from './_seed-utils.mjs';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const BOOTSTRAP_KEY = 'economic:worldbank-techreadiness:v1';
 const PROGRESS_KEY = 'economic:worldbank-progress:v1';
@@ -79,27 +77,6 @@ function maskToken(token) {
   return token.slice(0, 4) + '***' + token.slice(-4);
 }
 
-function loadEnvFile() {
-  const envPath = join(__dirname, '..', '.env.local');
-  if (!existsSync(envPath)) return;
-
-  const lines = readFileSync(envPath, 'utf8').split('\n');
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIdx = trimmed.indexOf('=');
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    let val = trimmed.slice(eqIdx + 1).trim();
-    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-      val = val.slice(1, -1);
-    }
-    if (!process.env[key]) {
-      process.env[key] = val;
-    }
-  }
-}
-
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
@@ -119,7 +96,7 @@ async function fetchWithRetry(url, attempt = 1) {
     return resp.json();
   } catch (err) {
     if (attempt < MAX_RETRIES) {
-      const delay = RETRY_BASE_MS * Math.pow(2, attempt - 1);
+      const delay = RETRY_BASE_MS * 2 ** (attempt - 1);
       console.warn(`  Retry ${attempt}/${MAX_RETRIES} for ${url} in ${delay}ms... (${err.message})`);
       await sleep(delay);
       return fetchWithRetry(url, attempt + 1);
@@ -292,7 +269,7 @@ async function fetchProgressData() {
     const data = raw[1]
       .filter(e => e.value !== null && e.value !== undefined)
       .map(e => ({ year: parseInt(e.date, 10), value: e.value }))
-      .filter(d => !isNaN(d.year))
+      .filter(d => !Number.isNaN(d.year))
       .sort((a, b) => a.year - b.year);
 
     console.log(`    → ${data.length} data points`);
@@ -343,7 +320,7 @@ async function fetchRenewableData() {
     arr.sort((a, b) => a.year - b.year);
   }
 
-  const worldData = byRegion['WLD'] || byRegion['1W'] || [];
+  const worldData = byRegion.WLD || byRegion['1W'] || [];
   const latest = worldData.length ? worldData[worldData.length - 1] : null;
 
   const regions = [];
@@ -374,7 +351,7 @@ async function fetchRenewableData() {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  loadEnvFile();
+  loadEnvFile(import.meta.url);
 
   const { env, sha } = parseArgs();
   const prefix = getKeyPrefix(env, sha);
@@ -439,6 +416,32 @@ async function main() {
   if (rankings.length === 0) {
     console.error('No rankings computed — aborting.');
     process.exit(1);
+  }
+
+  // Percentage-drop guard: if new count < 50% of prior count, extend TTLs instead of overwriting
+  try {
+    const priorMetaResp = await redisPipeline(redisUrl, redisToken, [
+      ['GET', `seed-meta:${BOOTSTRAP_KEY}`],
+    ]);
+    const priorMeta = priorMetaResp[0]?.result ? JSON.parse(priorMetaResp[0].result) : null;
+    if (priorMeta && typeof priorMeta.recordCount === 'number' && priorMeta.recordCount > 0) {
+      if (rankings.length < priorMeta.recordCount * 0.5) {
+        console.warn(`Rankings dropped >50%: ${rankings.length} vs prior ${priorMeta.recordCount} — extending TTLs instead of overwriting.`);
+        const extendPipeline = [
+          ['EXPIRE', fullKey, String(TTL_SECONDS)],
+          ['EXPIRE', `seed-meta:${BOOTSTRAP_KEY}`, String(TTL_SECONDS + 3600)],
+          ['EXPIRE', progressKey, String(TTL_SECONDS)],
+          ['EXPIRE', `seed-meta:${PROGRESS_KEY}`, String(TTL_SECONDS + 3600)],
+          ['EXPIRE', renewableKey, String(TTL_SECONDS)],
+          ['EXPIRE', `seed-meta:${RENEWABLE_KEY}`, String(TTL_SECONDS + 3600)],
+        ];
+        await redisPipeline(redisUrl, redisToken, extendPipeline);
+        console.log('TTLs extended. Exiting without overwriting.');
+        process.exit(0);
+      }
+    }
+  } catch (err) {
+    console.warn(`Percentage-drop guard failed (proceeding with write): ${err.message}`);
   }
 
   // Write all keys + seed-meta to Redis in one pipeline

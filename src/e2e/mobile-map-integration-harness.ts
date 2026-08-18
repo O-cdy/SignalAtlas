@@ -4,6 +4,12 @@ import { initI18n } from '../services/i18n';
 
 type MobileMapIntegrationHarness = {
   ready: boolean;
+  pendingDeferredCallbacks: number;
+  flushDeferredCallbacks: () => void;
+  destroyMap: () => void;
+  getDynamicLayerChildCount: () => number;
+  getInitialDynamicRendered: () => boolean;
+  getWrapperTransform: () => string;
   getPopupRect: () => {
     left: number;
     top: number;
@@ -25,6 +31,15 @@ declare global {
 const app = document.getElementById('app');
 if (!app) {
   throw new Error('Missing #app container for mobile map integration harness');
+}
+
+const controlDeferredCallbacks = new URLSearchParams(window.location.search).get('defer-control') === '1';
+const deferredCallbacks: IdleRequestCallback[] = [];
+if (controlDeferredCallbacks) {
+  window.requestIdleCallback = ((callback: IdleRequestCallback) => {
+    deferredCallbacks.push(callback);
+    return deferredCallbacks.length;
+  }) as typeof window.requestIdleCallback;
 }
 
 document.body.style.margin = '0';
@@ -74,7 +89,7 @@ window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       ? input.toString()
       : input.url;
 
-  if (url.includes('world-atlas@2/countries-50m.json')) {
+  if (url.includes('/data/countries-50m.json')) {
     return new Response(JSON.stringify(MINIMAL_WORLD_TOPOLOGY), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
@@ -86,6 +101,8 @@ window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 
 const layers = {
   gpsJamming: false,
+  satellites: false,
+
   conflicts: false,
   bases: false,
   cables: false,
@@ -96,6 +113,8 @@ const layers = {
   irradiators: false,
   sanctions: false,
   weather: false,
+  canadaRoads: false,
+  canadaAlerts: false,
   economic: false,
   waterways: false,
   outages: false,
@@ -130,10 +149,13 @@ const layers = {
   iranAttacks: false,
 
   ciiChoropleth: false,
+  resilienceScore: false,
   dayNight: false,
   miningSites: false,
   processingPlants: false,
   commodityPorts: false,
+  webcams: false,
+  diseaseOutbreaks: false,
 };
 
 await initI18n();
@@ -209,6 +231,27 @@ window.__mobileMapIntegrationHarness = {
   get ready() {
     return ready;
   },
+  get pendingDeferredCallbacks() {
+    return deferredCallbacks.length;
+  },
+  flushDeferredCallbacks: () => {
+    const callbacks = deferredCallbacks.splice(0);
+    callbacks.forEach((callback) => {
+      callback({
+        didTimeout: false,
+        timeRemaining: () => 50,
+      });
+    });
+  },
+  destroyMap: () => {
+    map.destroy();
+  },
+  getDynamicLayerChildCount: () =>
+    document.querySelector('.map-dynamic')?.childElementCount ?? 0,
+  getInitialDynamicRendered: () =>
+    Boolean((map as unknown as { initialDynamicRendered?: boolean }).initialDynamicRendered),
+  getWrapperTransform: () =>
+    (document.querySelector('.map-wrapper') as HTMLElement | null)?.style.transform ?? '',
   getPopupRect: () => {
     const element = document.querySelector('.map-popup') as HTMLElement | null;
     if (!element) return null;

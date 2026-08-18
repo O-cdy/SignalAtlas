@@ -1,15 +1,13 @@
-import {
-  UnrestServiceClient,
-  type UnrestEvent,
-  type ListUnrestEventsResponse,
-} from '@/generated/client/worldmonitor/unrest/v1/service_client';
+import { getRpcBaseUrl } from '@/services/rpc-client';
+import type { UnrestEvent, ListUnrestEventsResponse } from '@/generated/client/worldmonitor/unrest/v1/service_client';
 import type { SocialUnrestEvent, ProtestSeverity, ProtestEventType, ProtestSource } from '@/types';
 import { createCircuitBreaker } from '@/utils';
 import { getHydratedData } from '@/services/bootstrap';
+import { UnrestServiceClient } from '@/services/generated-rpc-clients';
 
 // ---- Client + Circuit Breaker ----
 
-const client = new UnrestServiceClient('', { fetch: (...args) => globalThis.fetch(...args) });
+const client = new UnrestServiceClient(getRpcBaseUrl(), { fetch: (...args) => globalThis.fetch(...args) });
 const unrestBreaker = createCircuitBreaker<ListUnrestEventsResponse>({
   name: 'Unrest Events',
   cacheTtlMs: 10 * 60 * 1000,
@@ -69,6 +67,7 @@ function toSocialUnrestEvent(e: UnrestEvent): SocialUnrestEvent {
     severity: mapSeverity(e.severity),
     fatalities: e.fatalities > 0 ? e.fatalities : undefined,
     sources: e.sources,
+    sourceUrls: e.sourceUrls?.length ? e.sourceUrls : undefined,
     sourceType: mapSourceType(e.sourceType),
     tags: e.tags.length > 0 ? e.tags : undefined,
     actors: e.actors.length > 0 ? e.actors : undefined,

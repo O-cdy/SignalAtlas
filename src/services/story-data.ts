@@ -1,4 +1,5 @@
-import { calculateCII, type CountryScore } from './country-instability';
+import type { CountryScore } from './country-instability';
+import { getCachedCountryScore, normalizeCiiCountryCode } from './cached-risk-scores';
 import type { ClusteredEvent } from '@/types';
 import type { ThreatLevel } from './threat-classifier';
 import { CURATED_COUNTRIES } from '@/config/countries';
@@ -62,10 +63,10 @@ export function collectStoryData(
   signals?: { protests: number; militaryFlights: number; militaryVessels: number; outages: number; gpsJammingHexes: number },
   convergence?: { score: number; signalTypes: string[]; regionalDescriptions: string[] } | null,
 ): StoryData {
-  const scores = calculateCII();
-  const countryScore = scores.find(s => s.code === countryCode) || null;
+  const normalizedCountryCode = normalizeCiiCountryCode(countryCode);
+  const countryScore: CountryScore | null = getCachedCountryScore(normalizedCountryCode);
 
-  const keywords = CURATED_COUNTRIES[countryCode]?.scoringKeywords || [countryName.toLowerCase()];
+  const keywords = CURATED_COUNTRIES[normalizedCountryCode]?.scoringKeywords || [countryName.toLowerCase()];
   const countryNews = allNews.filter(e => {
     const tokens = tokenizeForMatch(e.primaryTitle);
     return keywords.some(kw => matchKeyword(tokens, kw));
@@ -100,7 +101,7 @@ export function collectStoryData(
   }
 
   return {
-    countryCode,
+    countryCode: normalizedCountryCode,
     countryName,
     cii: countryScore ? {
       score: countryScore.score,
@@ -112,7 +113,13 @@ export function collectStoryData(
     news: sortedNews.slice(0, 5).map(n => ({
       title: n.primaryTitle,
       threatLevel: (n.threat?.level || 'info') as ThreatLevel,
-      sourceCount: n.sourceCount,
+      // #6428: the shared story card renders "N sources" — publishers, not
+      // articles (see story-renderer.ts). Guarded like its sibling call sites
+      // because TS's "required" is not a runtime guarantee here: playback
+      // restores ClusteredEvent objects straight out of the IndexedDB snapshot
+      // (event-handlers.ts restoreSnapshot, 7-day retention), so a cluster
+      // persisted before this field existed arrives without it.
+      sourceCount: n.uniquePublisherCount ?? 0,
     })),
     theater: theater ? {
       theaterName: theater.theaterName,
@@ -138,4 +145,3 @@ export function collectStoryData(
     convergence: convergence || null,
   };
 }
-

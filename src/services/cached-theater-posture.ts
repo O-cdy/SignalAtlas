@@ -1,15 +1,13 @@
 import type { TheaterPostureSummary } from './military-surge';
-import {
-  MilitaryServiceClient,
-  type GetTheaterPostureResponse,
-  type TheaterPosture,
-} from '@/generated/client/worldmonitor/military/v1/service_client';
+import { getRpcBaseUrl } from '@/services/rpc-client';
+import type { GetTheaterPostureResponse, TheaterPosture } from '@/generated/client/worldmonitor/military/v1/service_client';
 import { createCircuitBreaker } from '@/utils';
 import { getHydratedData } from '@/services/bootstrap';
+import { MilitaryServiceClient } from '@/services/generated-rpc-clients';
 
 // ---- Sebuf client ----
 
-const client = new MilitaryServiceClient('', { fetch: (...args) => globalThis.fetch(...args) });
+const client = new MilitaryServiceClient(getRpcBaseUrl(), { fetch: (...args) => globalThis.fetch(...args) });
 
 // ---- Legacy interface (preserved for consumer compatibility) ----
 
@@ -198,7 +196,7 @@ export async function fetchCachedTheaterPosture(signal?: AbortSignal): Promise<C
       const data = toPostureData(resp);
       saveToStorage(data);
       return data;
-    }, emptyFallback()),
+    }, emptyFallback(), { shouldCache: (r) => r.postures.length > 0 }),
     signal,
   );
 

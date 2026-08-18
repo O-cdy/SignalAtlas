@@ -1,183 +1,143 @@
 /**
- * ListPredictionMarkets RPC -- proxies the Gamma API for Polymarket prediction markets.
- *
- * Critical constraint: Gamma API is behind Cloudflare JA3 fingerprint detection
- * that blocks server-side TLS connections. The handler tries the fetch and
- * gracefully returns empty on failure -- identical to the existing api/polymarket.js
- * behavior. This is expected, not an error.
+ * ListPredictionMarkets RPC -- reads Railway-seeded prediction market data
+ * from Redis. All external API calls (Polymarket Gamma, Kalshi) happen on
+ * Railway seed scripts, never on Vercel.
  */
 
-import type {
-  PredictionServiceHandler,
-  ServerContext,
-  ListPredictionMarketsRequest,
-  ListPredictionMarketsResponse,
-  PredictionMarket,
+import {
+  type MarketSource,
+  type PredictionServiceHandler,
+  type ServerContext,
+  type ListPredictionMarketsRequest,
+  type ListPredictionMarketsResponse,
+  type PredictionMarket,
 } from '../../../../src/generated/server/worldmonitor/prediction/v1/service_server';
 
-import { CHROME_UA } from '../../../_shared/constants';
-import { cachedFetchJson, getCachedJson } from '../../../_shared/redis';
+import filterParamContracts from '../../../../shared/openapi-filter-param-contracts.json';
+import { clampInt } from '../../../_shared/constants';
+import { getCachedJson } from '../../../_shared/redis';
 
-const REDIS_CACHE_KEY = 'prediction:markets:v1';
-const REDIS_CACHE_TTL = 600; // 10 min
 const BOOTSTRAP_KEY = 'prediction:markets-bootstrap:v1';
 
-const GAMMA_BASE = 'https://gamma-api.polymarket.com';
-const FETCH_TIMEOUT = 8000;
+const TECH_CATEGORY_TAGS = filterParamContracts.predictionMarketTechCategories;
+const FINANCE_CATEGORY_TAGS = filterParamContracts.predictionMarketFinanceCategories;
 
-// ---------- Internal Gamma API types ----------
-
-interface GammaMarket {
-  question: string;
-  outcomes?: string;
-  outcomePrices?: string;
-  volume?: string;
-  volumeNum?: number;
-  closed?: boolean;
-  slug?: string;
-  endDate?: string;
-}
-
-interface GammaEvent {
-  id: string;
+interface BootstrapMarket {
   title: string;
-  slug: string;
-  volume?: number;
-  markets?: GammaMarket[];
-  closed?: boolean;
+  yesPrice: number;
+  volume: number;
+  url: string;
   endDate?: string;
+  source?: 'kalshi' | 'polymarket';
 }
 
-// ---------- Helpers ----------
+interface BootstrapData {
+  geopolitical?: BootstrapMarket[];
+  tech?: BootstrapMarket[];
+  finance?: BootstrapMarket[];
+  fetchedAt?: number;
+}
 
-/** Parse the yes-side price from a Gamma market's outcomePrices JSON string (0-1 scale). */
-function parseYesPrice(market: GammaMarket): number {
-  try {
-    const pricesStr = market.outcomePrices;
-    if (pricesStr) {
-      const prices: string[] = JSON.parse(pricesStr);
-      if (prices.length >= 1) {
-        const parsed = parseFloat(prices[0]!);
-        if (!isNaN(parsed)) return parsed; // 0-1 scale for proto
-      }
-    }
-  } catch {
-    /* keep default */
+const DEGENERATE_MARKET_SLUGS = new Set(['undefined', 'null', 'nan', '']);
+
+function bootstrapMarketIdentity(market: BootstrapMarket): string {
+  const url = String(market?.url ?? '').trim();
+  if (url) {
+    const path = url.split(/[?#]/)[0] ?? '';
+    const slug = path.replace(/\/+$/, '').split('/').pop() ?? '';
+    if (!DEGENERATE_MARKET_SLUGS.has(slug.toLowerCase())) return `url:${url}`;
   }
-  return 0.5;
+  return `title:${String(market?.title ?? '').trim().toLowerCase()}`;
 }
 
-/** Map a GammaEvent to a proto PredictionMarket (picks top market by volume). */
-function mapEvent(event: GammaEvent, category: string): PredictionMarket {
-  const topMarket = event.markets?.[0];
-  const endDateStr = topMarket?.endDate ?? event.endDate;
-  const closesAtMs = endDateStr ? Date.parse(endDateStr) : 0;
+function dedupeBootstrapMarkets(markets: BootstrapMarket[]): BootstrapMarket[] {
+  const best = new Map<string, BootstrapMarket>();
+  for (const market of markets) {
+    const identity = bootstrapMarketIdentity(market);
+    const incumbent = best.get(identity);
+    if (!incumbent) {
+      best.set(identity, market);
+      continue;
+    }
+    const incumbentVolume = Number(incumbent.volume);
+    const challengerVolume = Number(market.volume);
+    const incumbentRank = Number.isFinite(incumbentVolume) ? incumbentVolume : -Infinity;
+    const challengerRank = Number.isFinite(challengerVolume) ? challengerVolume : -Infinity;
+    if (challengerRank > incumbentRank) best.set(identity, market);
+  }
+  return [...best.values()];
+}
 
+function toProtoMarket(m: BootstrapMarket, category: string): PredictionMarket {
   return {
-    id: event.id || '',
-    title: topMarket?.question || event.title,
-    yesPrice: topMarket ? parseYesPrice(topMarket) : 0.5,
-    volume: event.volume ?? 0,
-    url: `https://polymarket.com/event/${event.slug}`,
-    closesAt: Number.isFinite(closesAtMs) ? closesAtMs : 0,
-    category: category || '',
+    id: m.url?.split('/').pop() || '',
+    title: m.title,
+    yesPrice: (m.yesPrice ?? 50) / 100,
+    volume: m.volume ?? 0,
+    url: m.url || '',
+    closesAt: m.endDate ? Date.parse(m.endDate) : 0,
+    category,
+    source: m.source === 'kalshi' ? 'MARKET_SOURCE_KALSHI' as MarketSource : 'MARKET_SOURCE_POLYMARKET' as MarketSource,
   };
 }
-
-/** Map a GammaMarket to a proto PredictionMarket. */
-function mapMarket(market: GammaMarket): PredictionMarket {
-  const closesAtMs = market.endDate ? Date.parse(market.endDate) : 0;
-  return {
-    id: market.slug || '',
-    title: market.question,
-    yesPrice: parseYesPrice(market),
-    volume: (market.volumeNum ?? (market.volume ? parseFloat(market.volume) : 0)) || 0,
-    url: `https://polymarket.com/market/${market.slug}`,
-    closesAt: Number.isFinite(closesAtMs) ? closesAtMs : 0,
-    category: '',
-  };
-}
-
-// ---------- RPC ----------
 
 export const listPredictionMarkets: PredictionServiceHandler['listPredictionMarkets'] = async (
   _ctx: ServerContext,
   req: ListPredictionMarketsRequest,
 ): Promise<ListPredictionMarketsResponse> => {
   try {
-    // Try Railway-seeded bootstrap data first (no Gamma API call needed)
-    if (!req.query) {
-      try {
-        const bootstrap = await getCachedJson(BOOTSTRAP_KEY) as { geopolitical?: PredictionMarket[]; tech?: PredictionMarket[] } | null;
-        if (bootstrap) {
-          const variant = req.category && ['ai', 'tech', 'crypto', 'science'].includes(req.category)
-            ? bootstrap.tech : bootstrap.geopolitical;
-          if (variant && variant.length > 0) {
-            const limit = Math.max(1, Math.min(100, req.pageSize || 50));
-            const markets: PredictionMarket[] = variant.slice(0, limit).map((m: PredictionMarket & { endDate?: string }) => ({
-              id: m.url?.split('/').pop() || '',
-              title: m.title,
-              yesPrice: (m.yesPrice ?? 50) / 100, // bootstrap stores 0-100, proto uses 0-1
-              volume: m.volume ?? 0,
-              url: m.url || '',
-              closesAt: m.endDate ? Date.parse(m.endDate) : 0,
-              category: req.category || '',
-            }));
-            return { markets, pagination: undefined };
-          }
-        }
-      } catch { /* bootstrap read failed, fall through */ }
+    const category = (req.category || '').slice(0, 50);
+    const query = (req.query || '').slice(0, 100);
+    const limit = clampInt(req.pageSize, 50, 1, 100);
+
+    const bootstrap = await getCachedJson(BOOTSTRAP_KEY) as BootstrapData | null;
+    if (!bootstrap) return { markets: [], pagination: undefined, fetchedAt: 0, dataAvailable: false };
+
+    const fetchedAt = Number(bootstrap.fetchedAt ?? 0);
+
+    const isTech = category && TECH_CATEGORY_TAGS.includes(category);
+    const isFinance = !isTech && category && FINANCE_CATEGORY_TAGS.includes(category);
+    // `category` is optional on this public endpoint, and omitting it must keep
+    // meaning "every market" (#5733). Before the producer's pools were made
+    // disjoint, `bootstrap.geopolitical` WAS every market, so the no-category
+    // caller and an explicit geopolitical-ish category (the site variant sends
+    // 'politics') could share one branch. Now they must not: the pool is
+    // strictly geopolitical, so an empty category has to union all three or the
+    // documented default response silently narrows to geo-only.
+    //
+    // The union is DEDUPED, not just concatenated: for up to the seeder's cron
+    // interval after this ships, Redis still holds a pre-#5733 payload whose
+    // pools are near-duplicates, and a naive concat would answer the default
+    // request with the same market three times. Deduping keeps the response
+    // correct for either payload vintage. Volume-sorted so it stays ranked
+    // rather than ordered pool-by-pool.
+    const unionAllPools = () => {
+      return dedupeBootstrapMarkets([
+        ...(bootstrap.geopolitical ?? []),
+        ...(bootstrap.tech ?? []),
+        ...(bootstrap.finance ?? []),
+      ]).sort((a, b) => (Number(b?.volume) || 0) - (Number(a?.volume) || 0));
+    };
+
+    // A finance request must NOT fall back to the geopolitical pool. That was
+    // harmless while geopolitical was a superset of every market; now it would
+    // answer "give me finance" with conflict and election markets.
+    const variant = isTech ? bootstrap.tech
+      : isFinance ? bootstrap.finance
+      : category ? bootstrap.geopolitical
+      : unionAllPools();
+
+    if (!variant || variant.length === 0) return { markets: [], pagination: undefined, fetchedAt, dataAvailable: false };
+
+    let markets = variant.map((m) => toProtoMarket(m, category));
+
+    if (query) {
+      const q = query.toLowerCase();
+      markets = markets.filter((m) => m.title.toLowerCase().includes(q));
     }
 
-    // Fallback: fetch from Gamma API directly (may fail due to JA3 blocking)
-    const cacheKey = `${REDIS_CACHE_KEY}:${req.category || 'all'}:${req.query || ''}:${req.pageSize || 50}`;
-    const result = await cachedFetchJson<ListPredictionMarketsResponse>(
-      cacheKey,
-      REDIS_CACHE_TTL,
-      async () => {
-        const useEvents = !!req.category;
-        const endpoint = useEvents ? 'events' : 'markets';
-        const limit = Math.max(1, Math.min(100, req.pageSize || 50));
-        const params = new URLSearchParams({
-          closed: 'false',
-          active: 'true',
-          archived: 'false',
-          end_date_min: new Date().toISOString(),
-          order: 'volume',
-          ascending: 'false',
-          limit: String(limit),
-        });
-        if (useEvents) {
-          params.set('tag_slug', req.category);
-        }
-
-        const response = await fetch(
-          `${GAMMA_BASE}/${endpoint}?${params}`,
-          {
-            headers: { Accept: 'application/json', 'User-Agent': CHROME_UA },
-            signal: AbortSignal.timeout(FETCH_TIMEOUT),
-          },
-        );
-        if (!response.ok) return null;
-
-        const data: unknown = await response.json();
-        let markets: PredictionMarket[];
-        if (useEvents) {
-          markets = (data as GammaEvent[]).map((e) => mapEvent(e, req.category));
-        } else {
-          markets = (data as GammaMarket[]).map(mapMarket);
-        }
-
-        if (req.query) {
-          const q = req.query.toLowerCase();
-          markets = markets.filter((m) => m.title.toLowerCase().includes(q));
-        }
-
-        return markets.length > 0 ? { markets, pagination: undefined } : null;
-      },
-    );
-    return result || { markets: [], pagination: undefined };
+    return { markets: markets.slice(0, limit), pagination: undefined, fetchedAt, dataAvailable: true };
   } catch {
-    return { markets: [], pagination: undefined };
+    return { markets: [], pagination: undefined, fetchedAt: 0, dataAvailable: false };
   }
 };

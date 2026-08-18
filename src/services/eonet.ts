@@ -1,11 +1,10 @@
 import type { NaturalEvent, NaturalEventCategory } from '@/types';
+import { getRpcBaseUrl } from '@/services/rpc-client';
 import { NATURAL_EVENT_CATEGORIES } from '@/types';
-import {
-  NaturalServiceClient,
-  type ListNaturalEventsResponse,
-} from '@/generated/client/worldmonitor/natural/v1/service_client';
+import type { ListNaturalEventsResponse } from '@/generated/client/worldmonitor/natural/v1/service_client';
 import { createCircuitBreaker } from '@/utils';
 import { getHydratedData } from '@/services/bootstrap';
+import { NaturalServiceClient } from '@/services/generated-rpc-clients';
 
 const CATEGORY_ICONS: Record<NaturalEventCategory, string> = {
   severeStorms: '🌀',
@@ -34,10 +33,10 @@ function normalizeNaturalCategory(category: string | undefined): NaturalEventCat
     : 'manmade';
 }
 
-const client = new NaturalServiceClient('', { fetch: (...args) => globalThis.fetch(...args) });
+const client = new NaturalServiceClient(getRpcBaseUrl(), { fetch: (...args) => globalThis.fetch(...args) });
 const breaker = createCircuitBreaker<ListNaturalEventsResponse>({ name: 'NaturalEvents', cacheTtlMs: 30 * 60 * 1000, persistCache: true });
 
-const emptyFallback: ListNaturalEventsResponse = { events: [] };
+const emptyFallback: ListNaturalEventsResponse = { events: [], fetchedAt: 0, dataAvailable: false };
 
 function toNaturalEvent(e: ListNaturalEventsResponse['events'][number]): NaturalEvent {
   return {
@@ -54,6 +53,25 @@ function toNaturalEvent(e: ListNaturalEventsResponse['events'][number]): Natural
     sourceUrl: e.sourceUrl || undefined,
     sourceName: e.sourceName || undefined,
     closed: e.closed,
+    stormId: e.stormId || undefined,
+    stormName: e.stormName || undefined,
+    basin: e.basin || undefined,
+    stormCategory: e.stormCategory ?? undefined,
+    classification: e.classification || undefined,
+    windKt: e.windKt ?? undefined,
+    pressureMb: e.pressureMb ?? undefined,
+    movementDir: e.movementDir ?? undefined,
+    movementSpeedKt: e.movementSpeedKt ?? undefined,
+    forecastTrack: e.forecastTrack?.length ? e.forecastTrack : undefined,
+    conePolygon: e.conePolygon?.length
+      ? e.conePolygon.map(ring => ring.points.map(p => [p.lon, p.lat]))
+      : undefined,
+    pastTrack: e.pastTrack?.length ? e.pastTrack : undefined,
+    canonicalId: e.canonicalId || undefined,
+    matchingConfidence: e.matchingConfidence || undefined,
+    canonicalAliases: e.canonicalAliases?.length ? e.canonicalAliases : undefined,
+    windAveragingPeriodMinutes: e.windAveragingPeriodMinutes ?? undefined,
+    agencyObservations: e.agencyObservations?.length ? e.agencyObservations : undefined,
   };
 }
 
@@ -61,7 +79,7 @@ export async function fetchNaturalEvents(_days = 30): Promise<NaturalEvent[]> {
   const hydrated = getHydratedData('naturalEvents') as ListNaturalEventsResponse | undefined;
   const response = (hydrated?.events?.length ? hydrated : null) ?? await breaker.execute(async () => {
     return client.listNaturalEvents({ days: 30 });
-  }, emptyFallback);
+  }, emptyFallback, { shouldCache: (r) => r.events.length > 0 });
 
   return (response.events || []).map(toNaturalEvent);
 }

@@ -1,29 +1,12 @@
 /**
  * Shared helpers, types, and constants for the market service handler RPCs.
  */
-import { CHROME_UA, yahooGate } from '../../../_shared/constants';
-
-// ========================================================================
-// Relay helpers (Railway proxy for Yahoo when Vercel IPs are rate-limited)
-// ========================================================================
-
-function getRelayBaseUrl(): string | null {
-  const relayUrl = process.env.WS_RELAY_URL;
-  if (!relayUrl) return null;
-  return relayUrl
-    .replace(/^ws(s?):\/\//, 'http$1://')
-    .replace(/\/$/, '');
-}
-
-function getRelayHeaders(): Record<string, string> {
-  const headers: Record<string, string> = { 'User-Agent': CHROME_UA };
-  const relaySecret = process.env.RELAY_SHARED_SECRET;
-  if (relaySecret) {
-    const relayHeader = (process.env.RELAY_AUTH_HEADER || 'x-relay-key').toLowerCase();
-    headers[relayHeader] = relaySecret;
-  }
-  return headers;
-}
+import { CHROME_UA, finnhubGate, yahooGate } from '../../../_shared/constants';
+import { getRelayBaseUrl, getRelayHeaders } from '../../../_shared/relay';
+export { getRelayBaseUrl, getRelayHeaders };
+import cryptoConfig from '../../../../shared/crypto.json';
+import stablecoinConfig from '../../../../shared/stablecoins.json';
+export { parseStringArray } from '../../../_shared/parse-string-array';
 
 // ========================================================================
 // Constants
@@ -31,16 +14,8 @@ function getRelayHeaders(): Record<string, string> {
 
 export const UPSTREAM_TIMEOUT_MS = 10_000;
 
-/**
- * Defensive parser for repeated-string query params.
- * The sebuf codegen assigns `params.get("symbols")` (a string) to a field
- * typed as `string[]`.  At runtime `req.symbols` may therefore be a
- * comma-separated string rather than an actual array.
- */
-export function parseStringArray(raw: unknown): string[] {
-  if (Array.isArray(raw)) return raw.filter(Boolean);
-  if (typeof raw === 'string' && raw.length > 0) return raw.split(',').filter(Boolean);
-  return [];
+export function sanitizeSymbol(raw: string): string {
+  return raw.trim().replace(/\s+/g, '').slice(0, 32).toUpperCase();
 }
 
 export async function fetchYahooQuotesBatch(
@@ -63,19 +38,13 @@ export async function fetchYahooQuotesBatch(
   return { results, rateLimited: rateLimitHits > symbols.length / 2 };
 }
 
-// Yahoo-only symbols: indices and futures not on Finnhub free tier
-export const YAHOO_ONLY_SYMBOLS = new Set([
-  '^GSPC', '^DJI', '^IXIC', '^VIX',
-  'GC=F', 'CL=F', 'NG=F', 'SI=F', 'HG=F',
-]);
+// The Yahoo-only symbol list that used to live here was dead after #1684 (the
+// handler became a pure seed read) and had drifted to a subset of the routing
+// list the relay actually uses. `shared/stocks.json#yahooOnly` is the single
+// source of truth; `./_quote-provider.ts` reads it to decide what Finnhub can
+// serve.
 
-// Known crypto IDs and their metadata
-export const CRYPTO_META: Record<string, { name: string; symbol: string }> = {
-  bitcoin: { name: 'Bitcoin', symbol: 'BTC' },
-  ethereum: { name: 'Ethereum', symbol: 'ETH' },
-  solana: { name: 'Solana', symbol: 'SOL' },
-  ripple: { name: 'XRP', symbol: 'XRP' },
-};
+export const CRYPTO_META: Record<string, { name: string; symbol: string }> = cryptoConfig.meta;
 
 // ========================================================================
 // Types
@@ -111,6 +80,121 @@ export interface CoinGeckoMarketItem {
 }
 
 // ========================================================================
+// Alpha Vantage fetchers
+// ========================================================================
+
+// Physical commodity function names for Alpha Vantage (no futures notation needed)
+export const AV_PHYSICAL_COMMODITY_MAP: Record<string, string> = {
+  'CL=F': 'WTI',
+  'BZ=F': 'BRENT',
+  'NG=F': 'NATURAL_GAS',
+  'HG=F': 'COPPER',
+  'ALI=F': 'ALUMINUM',
+  'GC=F': 'GOLD',
+  'SI=F': 'SILVER',
+};
+
+export async function fetchAlphaVantageQuotesBatch(
+  symbols: string[],
+  apiKey: string,
+): Promise<Map<string, { price: number; change: number; sparkline: number[] }>> {
+  const results = new Map<string, { price: number; change: number; sparkline: number[] }>();
+  const BATCH = 100;
+  const AV_BATCH_DELAY_MS = 500;
+  for (let i = 0; i < symbols.length; i += BATCH) {
+    if (i > 0) await new Promise<void>(r => setTimeout(r, AV_BATCH_DELAY_MS));
+    const chunk = symbols.slice(i, i + BATCH);
+    const url = `https://www.alphavantage.co/query?function=REALTIME_BULK_QUOTES&symbol=${encodeURIComponent(chunk.join(','))}&apikey=${encodeURIComponent(apiKey)}`;
+    let resp: Response | null = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (attempt > 0) await new Promise<void>(r => setTimeout(r, 1000));
+        resp = await fetch(url, {
+          headers: { 'User-Agent': CHROME_UA, Accept: 'application/json' },
+          signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+        });
+        break;
+      } catch (err) {
+        console.warn(`[AV] Bulk quotes fetch error (attempt ${attempt + 1}):`, (err as Error).message);
+      }
+    }
+    if (!resp) continue;
+    if (!resp.ok) {
+      console.warn(`[AV] Bulk quotes HTTP ${resp.status}`);
+      continue;
+    }
+    try {
+      const json = await resp.json() as { data?: Array<{ symbol: string; price: string; 'previous close': string; 'change percent': string }>; Information?: string };
+      if (json.Information) {
+        const remaining = symbols.length - i - chunk.length;
+        console.warn(`[AV] Rate limit hit${remaining > 0 ? ` — dropping ${remaining} remaining symbols` : ''}: ${json.Information.slice(0, 80)}`);
+        break;
+      }
+      if (!Array.isArray(json.data)) continue;
+      for (const item of json.data) {
+        const price = parseFloat(item.price);
+        const prevClose = parseFloat(item['previous close']);
+        const changePct = Number.isFinite(prevClose) && prevClose > 0
+          ? ((price - prevClose) / prevClose) * 100
+          : parseFloat((item['change percent'] || '0').replace('%', ''));
+        if (Number.isFinite(price) && price > 0) {
+          results.set(item.symbol, { price, change: Number.isFinite(changePct) ? changePct : 0, sparkline: [] });
+        }
+      }
+    } catch (err) {
+      console.warn(`[AV] Bulk quotes parse error:`, (err as Error).message);
+    }
+  }
+  return results;
+}
+
+export async function fetchAlphaVantagePhysicalCommodity(
+  yahooSymbol: string,
+  apiKey: string,
+): Promise<{ price: number; change: number; sparkline: number[] } | null> {
+  const fn = AV_PHYSICAL_COMMODITY_MAP[yahooSymbol];
+  if (!fn) return null;
+  const url = `https://www.alphavantage.co/query?function=${fn}&interval=daily&apikey=${encodeURIComponent(apiKey)}`;
+  let resp: Response | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      if (attempt > 0) await new Promise<void>(r => setTimeout(r, 1000));
+      resp = await fetch(url, {
+        headers: { 'User-Agent': CHROME_UA, Accept: 'application/json' },
+        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      });
+      break;
+    } catch (err) {
+      console.warn(`[AV] ${fn} fetch error (attempt ${attempt + 1}):`, (err as Error).message);
+    }
+  }
+  if (!resp) return null;
+  if (!resp.ok) {
+    console.warn(`[AV] ${fn} HTTP ${resp.status}`);
+    return null;
+  }
+  try {
+    const json = await resp.json() as { data?: Array<{ date: string; value: string }>; Information?: string };
+    if (json.Information) {
+      console.warn(`[AV] Rate limit hit: ${json.Information.slice(0, 100)}`);
+      return null;
+    }
+    const data = json.data;
+    if (!Array.isArray(data) || data.length < 2) return null;
+    const latest = parseFloat(data[0]!.value);
+    const prev = parseFloat(data[1]!.value);
+    if (!Number.isFinite(latest) || latest <= 0) return null;
+    const change = Number.isFinite(prev) && prev > 0 ? ((latest - prev) / prev) * 100 : 0;
+    // Build sparkline from last 7 daily closes (oldest → newest)
+    const sparkline = data.slice(0, 7).map(d => parseFloat(d.value)).filter(Number.isFinite).reverse();
+    return { price: latest, change, sparkline };
+  } catch (err) {
+    console.warn(`[AV] ${fn} parse error:`, (err as Error).message);
+    return null;
+  }
+}
+
+// ========================================================================
 // Finnhub quote fetcher
 // ========================================================================
 
@@ -119,6 +203,7 @@ export async function fetchFinnhubQuote(
   apiKey: string,
 ): Promise<{ symbol: string; price: number; changePercent: number } | null> {
   try {
+    await finnhubGate();
     const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}`;
     const resp = await fetch(url, {
       headers: { Accept: 'application/json', 'User-Agent': CHROME_UA, 'X-Finnhub-Token': apiKey },
@@ -145,33 +230,16 @@ export async function fetchFinnhubQuote(
 // ========================================================================
 // Yahoo Finance quote fetcher
 // ========================================================================
-// TODO: Add Financial Modeling Prep (FMP) as Yahoo Finance fallback.
-//
-// FMP API docs: https://site.financialmodelingprep.com/developer/docs
-// Auth: API key required — env var FMP_API_KEY
-// Free tier: 250 requests/day (paid tiers for higher volume)
-//
-// Endpoint mapping (Yahoo → FMP):
-//   Quote:      /stable/quote?symbol=AAPL           (batch: comma-separated)
-//   Indices:    /stable/quote?symbol=^GSPC           (^GSPC, ^DJI, ^IXIC supported)
-//   Commodities:/stable/quote?symbol=GCUSD           (gold=GCUSD, oil=CLUSD, etc.)
-//   Forex:      /stable/batch-forex-quotes            (JPY/USD pairs)
-//   Crypto:     /stable/batch-crypto-quotes           (BTC, ETH, etc.)
-//   Sparkline:  /stable/historical-price-eod/light?symbol=AAPL  (daily close)
-//   Intraday:   /stable/historical-chart/1min?symbol=AAPL
-//
-// Symbol mapping needed:
-//   ^GSPC → ^GSPC (same), ^VIX → ^VIX (same)
-//   GC=F → GCUSD, CL=F → CLUSD, NG=F → NGUSD, SI=F → SIUSD, HG=F → HGUSD
-//   JPY=X → JPYUSD (forex pair format differs)
-//   BTC-USD → BTCUSD
-//
-// Implementation plan:
-//   1. Add FMP_API_KEY to SUPPORTED_SECRET_KEYS in main.rs + settings UI
-//   2. Create fetchFMPQuote() here returning same shape as fetchYahooQuote()
-//   3. fetchYahooQuote() tries Yahoo first → on 429/failure, tries FMP if key exists
-//   4. economic/_shared.ts fetchJSON() same fallback for Yahoo chart URLs
-//   5. get-macro-signals.ts needs chart data (1y range) — use /stable/historical-price-eod/light
+// Provider decision (#6304): FMP is **not** the authorized fallback.
+// FMP ToS §2.2.1–2.2.2 prohibit commercial display/redistribution without a
+// separate Data Display and Licensing Agreement. WorldMonitor instead uses:
+//   - Finnhub (primary request-time equity gap fetch; watchlist search)
+//   - Alpha Vantage (authorized fallback + seeder bulk / physical commodities / FX)
+//   - CoinGecko / CoinPaprika (crypto)
+// See `./_quote-provider.ts`, `scripts/shared/market-quote-provider.mjs`, and
+// docs/finance-data.mdx § "Authorized market-data providers".
+// Yahoo residual paths remain only where no authorized provider covers the
+// instrument yet (#3731 tracks full retirement).
 // ========================================================================
 
 function parseYahooChartResponse(data: YahooChartResponse): { price: number; change: number; sparkline: number[] } | null {
@@ -239,19 +307,54 @@ export async function fetchYahooQuote(
 // CoinGecko fetcher
 // ========================================================================
 
-export async function fetchCoinGeckoMarkets(
-  ids: string[],
-): Promise<CoinGeckoMarketItem[]> {
-  const apiKey = process.env.COINGECKO_API_KEY;
-  const baseUrl = apiKey
-    ? 'https://pro-api.coingecko.com/api/v3'
-    : 'https://api.coingecko.com/api/v3';
-  const url = `${baseUrl}/coins/markets?vs_currency=usd&ids=${ids.join(',')}&order=market_cap_desc&sparkline=true&price_change_percentage=24h`;
+/**
+ * Resolve the CoinGecko base URL + auth header for the configured key tier.
+ *
+ * CoinGecko's free Demo plan and paid Pro plan share the `CG-` key prefix but
+ * use different hosts and auth headers — a Demo key sent to the Pro host fails
+ * with HTTP 400 (error 10011: "change your root URL from pro-api.coingecko.com
+ * to api.coingecko.com"). The key string can't reveal the tier, so it is
+ * selected explicitly by which env var is set; Pro wins so existing Pro
+ * deployments are unaffected, and no key falls back to the public endpoint.
+ */
+export function coingeckoEndpoint(): { baseUrl: string; headers: Record<string, string>; tier: 'pro' | 'demo' | 'keyless' } {
+  const proKey = process.env.COINGECKO_API_KEY;
+  const demoKey = process.env.COINGECKO_DEMO_API_KEY;
   const headers: Record<string, string> = {
     Accept: 'application/json',
     'User-Agent': CHROME_UA,
   };
-  if (apiKey) headers['x-cg-pro-api-key'] = apiKey;
+  if (proKey) {
+    headers['x-cg-pro-api-key'] = proKey;
+    return { baseUrl: 'https://pro-api.coingecko.com/api/v3', headers, tier: 'pro' };
+  }
+  if (demoKey) {
+    headers['x-cg-demo-api-key'] = demoKey;
+    return { baseUrl: 'https://api.coingecko.com/api/v3', headers, tier: 'demo' };
+  }
+  return { baseUrl: 'https://api.coingecko.com/api/v3', headers, tier: 'keyless' };
+}
+
+/**
+ * Shape of the `/coins/markets` projection. Defaults reproduce the original
+ * call exactly (sparkline on, 24h window) so existing callers are unchanged;
+ * the stablecoin RPC asks for `24h,7d` and no sparkline, because it must
+ * populate a `change7d` field and renders no chart. Requesting `7d` is not
+ * optional there: CoinGecko omits `price_change_percentage_7d_in_currency`
+ * unless the window is named, which would silently zero the column.
+ */
+export interface CoinGeckoMarketsOpts {
+  sparkline?: boolean;
+  priceChangePercentage?: string;
+}
+
+export async function fetchCoinGeckoMarkets(
+  ids: string[],
+  opts: CoinGeckoMarketsOpts = {},
+): Promise<CoinGeckoMarketItem[]> {
+  const { sparkline = true, priceChangePercentage = '24h' } = opts;
+  const { baseUrl, headers } = coingeckoEndpoint();
+  const url = `${baseUrl}/coins/markets?vs_currency=usd&ids=${ids.join(',')}&order=market_cap_desc&sparkline=${sparkline}&price_change_percentage=${encodeURIComponent(priceChangePercentage)}`;
 
   const resp = await fetch(url, {
     headers,
@@ -273,17 +376,10 @@ export async function fetchCoinGeckoMarkets(
 // CoinPaprika fallback fetcher
 // ========================================================================
 
-// CoinGecko ID → CoinPaprika ID mapping
+// CoinGecko ID → CoinPaprika ID mapping (shared ids + stablecoin-specific)
 const COINPAPRIKA_ID_MAP: Record<string, string> = {
-  bitcoin: 'btc-bitcoin',
-  ethereum: 'eth-ethereum',
-  solana: 'sol-solana',
-  ripple: 'xrp-ripple',
-  tether: 'usdt-tether',
-  'usd-coin': 'usdc-usd-coin',
-  dai: 'dai-dai',
-  'first-digital-usd': 'fdusd-first-digital-usd',
-  'ethena-usde': 'usde-ethena-usde',
+  ...cryptoConfig.coinpaprika,
+  ...stablecoinConfig.coinpaprika,
 };
 
 interface CoinPaprikaTicker {
@@ -301,22 +397,72 @@ interface CoinPaprikaTicker {
   };
 }
 
+const COINPAPRIKA_FETCH_CONCURRENCY = 4;
+
+async function fetchCoinPaprikaTickersById(
+  paprikaIds: string[],
+): Promise<CoinPaprikaTicker[]> {
+  const ids = [...new Set(paprikaIds.filter((id): id is string => Boolean(id)))];
+  if (ids.length === 0) return [];
+
+  const results = await allSettledWithConcurrency(ids, COINPAPRIKA_FETCH_CONCURRENCY, async id => {
+    const resp = await fetch(`https://api.coinpaprika.com/v1/tickers/${encodeURIComponent(id)}?quotes=USD`, {
+      headers: { Accept: 'application/json', 'User-Agent': CHROME_UA },
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+    });
+    if (!resp.ok) throw new Error(`CoinPaprika ${id} HTTP ${resp.status}`);
+    return resp.json() as Promise<CoinPaprikaTicker>;
+  });
+
+  const tickers: CoinPaprikaTicker[] = [];
+  const failures: unknown[] = [];
+  for (const [index, result] of results.entries()) {
+    if (result.status === 'fulfilled') {
+      tickers.push(result.value);
+    } else {
+      failures.push(result.reason);
+      console.warn(`[CoinPaprika] Skipping ${ids[index] ?? 'unknown'}:`, (result.reason as Error).message || result.reason);
+    }
+  }
+
+  if (tickers.length === 0 && failures.length > 0) {
+    throw new Error(`All ${failures.length} CoinPaprika ticker request(s) failed`);
+  }
+
+  return tickers;
+}
+
+async function allSettledWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results: PromiseSettledResult<R>[] = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      try {
+        results[index] = { status: 'fulfilled', value: await mapper(items[index]!, index) };
+      } catch (reason) {
+        results[index] = { status: 'rejected', reason };
+      }
+    }
+  }));
+
+  return results;
+}
+
 export async function fetchCoinPaprikaMarkets(
   geckoIds: string[],
 ): Promise<CoinGeckoMarketItem[]> {
-  const paprikaIds = geckoIds.map(id => COINPAPRIKA_ID_MAP[id]).filter(Boolean);
+  const paprikaIds = geckoIds.map(id => COINPAPRIKA_ID_MAP[id]).filter((id): id is string => Boolean(id));
   if (paprikaIds.length === 0) throw new Error('No CoinPaprika ID mapping for requested coins');
 
-  const resp = await fetch('https://api.coinpaprika.com/v1/tickers?quotes=USD', {
-    headers: { Accept: 'application/json', 'User-Agent': CHROME_UA },
-    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-  });
-  if (!resp.ok) throw new Error(`CoinPaprika HTTP ${resp.status}`);
-
-  const allTickers: CoinPaprikaTicker[] = await resp.json();
-  const paprikaSet = new Set(paprikaIds);
-  const matched = allTickers.filter(t => paprikaSet.has(t.id));
-
+  const matched = await fetchCoinPaprikaTickersById(paprikaIds);
   const reverseMap = new Map(Object.entries(COINPAPRIKA_ID_MAP).map(([g, p]) => [p, g]));
 
   return matched.map(t => {
@@ -340,13 +486,39 @@ export async function fetchCoinPaprikaMarkets(
 // Unified crypto market fetcher: CoinGecko → CoinPaprika fallback
 // ========================================================================
 
+export type CryptoMarketsSource = 'coingecko' | 'coinpaprika';
+
+/**
+ * Same ladder as `fetchCryptoMarkets`, but names the leg that answered.
+ *
+ * The two legs do not have the same reach: CoinGecko resolves any ID it knows,
+ * while CoinPaprika can only answer for IDs present in COINPAPRIKA_ID_MAP. So
+ * "absent from the result" means "no such coin" on the primary and merely
+ * "outside our mapping table" on the fallback. A caller that reports per-ID
+ * outcomes has to tell those apart; one that just renders the rows does not,
+ * and should keep using `fetchCryptoMarkets`.
+ */
+export async function fetchCryptoMarketsWithSource(
+  ids: string[],
+  opts: CoinGeckoMarketsOpts = {},
+): Promise<{ items: CoinGeckoMarketItem[]; source: CryptoMarketsSource }> {
+  try {
+    return { items: await fetchCoinGeckoMarkets(ids, opts), source: 'coingecko' };
+  } catch (err) {
+    // sentry-coverage-ok: a primary-leg failure is the expected trigger for
+    // this ladder, and the CoinPaprika call below owns recovery. If that leg
+    // fails too the error propagates to the caller, which is where the
+    // both-providers-down condition is worth reporting.
+    console.warn(`[CoinGecko] Failed, falling back to CoinPaprika:`, (err as Error).message);
+    // No opts pass-through: CoinPaprika's ticker response always carries both
+    // the 24h and 7d change, so the projection knobs have nothing to select.
+    return { items: await fetchCoinPaprikaMarkets(ids), source: 'coinpaprika' };
+  }
+}
+
 export async function fetchCryptoMarkets(
   ids: string[],
+  opts: CoinGeckoMarketsOpts = {},
 ): Promise<CoinGeckoMarketItem[]> {
-  try {
-    return await fetchCoinGeckoMarkets(ids);
-  } catch (err) {
-    console.warn(`[CoinGecko] Failed, falling back to CoinPaprika:`, (err as Error).message);
-    return fetchCoinPaprikaMarkets(ids);
-  }
+  return (await fetchCryptoMarketsWithSource(ids, opts)).items;
 }

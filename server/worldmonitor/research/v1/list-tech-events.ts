@@ -18,32 +18,89 @@ import type {
   TechEvent,
   TechEventCoords,
 } from '../../../../src/generated/server/worldmonitor/research/v1/service_server';
-import { CITY_COORDS } from '../../../../api/data/city-coords';
-import { CHROME_UA, clampInt } from '../../../_shared/constants';
+import { CITY_COORDS } from '../../../_shared/city-coords';
+import filterParamContracts from '../../../../shared/openapi-filter-param-contracts.json';
+import { CHROME_UA } from '../../../_shared/constants';
+import { resolveTechEventsPaging, type TechEventsPagingPresence } from './_tech-events-paging';
 import { cachedFetchJson } from '../../../_shared/redis';
+import { getRelayBaseUrl, getRelayHeaders } from '../../../_shared/relay';
 
 const REDIS_CACHE_KEY = 'research:tech-events:v1';
 const REDIS_CACHE_TTL = 21600; // 6 hr — weekly event data
+
+/**
+ * Set on the response when neither the seeder nor the cold-start fetch could
+ * supply upstream data. Doubles as the gateway's no-store signal — see the
+ * comment at the early return in `listTechEvents`. Exported for the tests that
+ * pin that contract.
+ */
+export const TECH_EVENTS_UNAVAILABLE_ERROR = 'tech events unavailable: no upstream data';
 
 // ---------- Constants ----------
 
 const ICS_URL = 'https://www.techmeme.com/newsy_events.ics';
 const DEV_EVENTS_RSS = 'https://dev.events/rss.xml';
+const FETCH_TIMEOUT_MS = 8000;
+const TECH_EVENT_TYPES = new Set(filterParamContracts.researchTechEventTypes);
+
+function readTechEventsPagingPresence(ctx: ServerContext): TechEventsPagingPresence {
+  const searchParams = new URL(ctx.request.url, 'http://localhost').searchParams;
+  return {
+    hasLimit: searchParams.has('limit'),
+    hasDays: searchParams.has('days'),
+  };
+}
+
+// ---------- Relay helpers (Railway proxy for blocked sources) ----------
+
+const RSS_ACCEPT = 'application/rss+xml, application/xml, text/xml, text/calendar, */*';
+
+async function fetchTextWithRelay(url: string): Promise<string | null> {
+  // Try direct fetch first
+  try {
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': CHROME_UA },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+    if (resp.ok) {
+      const text = await resp.text();
+      if (text.length > 100) return text;
+      console.warn(`[tech-events] Direct fetch ${url} returned short response (${text.length} chars)`);
+    } else {
+      console.warn(`[tech-events] Direct fetch ${url}: HTTP ${resp.status}`);
+    }
+  } catch (e) {
+    console.warn(`[tech-events] Direct fetch ${url} failed: ${(e as Error).message}`);
+  }
+
+  // Fallback: route through Railway relay (different IP, avoids Vercel edge blocks)
+  const relayBase = getRelayBaseUrl();
+  if (relayBase) {
+    try {
+      const relayUrl = `${relayBase}/rss?url=${encodeURIComponent(url)}`;
+      const resp = await fetch(relayUrl, {
+        headers: getRelayHeaders({ Accept: RSS_ACCEPT }),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+      if (resp.ok) {
+        const text = await resp.text();
+        if (text.length > 100) {
+          console.log(`[tech-events] Relay fetch ${url}: success (${text.length} chars)`);
+          return text;
+        }
+      } else {
+        console.warn(`[tech-events] Relay fetch ${url}: HTTP ${resp.status}`);
+      }
+    } catch (e) {
+      console.warn(`[tech-events] Relay fetch ${url} failed: ${(e as Error).message}`);
+    }
+  }
+
+  return null;
+}
 
 // Curated major tech events that may fall off limited RSS feeds
 const CURATED_EVENTS: TechEvent[] = [
-  {
-    id: 'step-dubai-2026',
-    title: 'STEP Dubai 2026',
-    type: 'conference',
-    location: 'Dubai Internet City, Dubai',
-    coords: { lat: 25.0956, lng: 55.1548, country: 'UAE', original: 'Dubai Internet City, Dubai', virtual: false },
-    startDate: '2026-02-11',
-    endDate: '2026-02-12',
-    url: 'https://dubai.stepconference.com',
-    source: 'curated',
-    description: 'Intelligence Everywhere: The AI Economy - 8,000+ attendees, 400+ startups',
-  },
   {
     id: 'gitex-global-2026',
     title: 'GITEX Global 2026',
@@ -209,7 +266,7 @@ function parseDevEventsRSS(rssText: string): TechEvent[] {
     let startDate: string | null = null;
     if (dateMatch) {
       const parsed = new Date(dateMatch[1]!);
-      if (!isNaN(parsed.getTime())) {
+      if (!Number.isNaN(parsed.getTime())) {
         startDate = parsed.toISOString().split('T')[0]!;
       }
     }
@@ -254,38 +311,51 @@ function parseDevEventsRSS(rssText: string): TechEvent[] {
 
 // ---------- Fetch ----------
 
-async function fetchTechEvents(req: ListTechEventsRequest): Promise<ListTechEventsResponse> {
-  const { type, mappable } = req;
-  const limit = clampInt(req.limit, 50, 1, 200);
-  const days = clampInt(req.days, 90, 1, 365);
+/** Number of external feeds (Techmeme ICS + dev.events RSS) behind a fetch. */
+const EXTERNAL_SOURCE_COUNT = 2;
 
-  // Fetch both sources in parallel
-  const [icsResponse, rssResponse] = await Promise.allSettled([
-    fetch(ICS_URL, {
-      headers: { 'User-Agent': CHROME_UA },
-    }),
-    fetch(DEV_EVENTS_RSS, {
-      headers: { 'User-Agent': CHROME_UA },
-    }),
+/**
+ * Collect the FULL event set: both feeds, plus curated, deduped and sorted.
+ *
+ * Takes no request and applies no narrowing, by design. This is the writer for
+ * the shared, request-independent `research:tech-events:v1` key, so it must
+ * produce what the seeders produce (scripts/ais-relay.cjs `seedTechEvents`,
+ * scripts/seed-research.mjs) — they apply no type/mappable/days/limit filter
+ * either. #5427 happened because this function accepted a request and narrowed
+ * by it, so one caller's view became every caller's view for the 6h TTL. With
+ * no request parameter that bug cannot be expressed here at all.
+ *
+ * Per-request narrowing belongs exclusively to `filterEvents()` on the read
+ * path, which re-applies every filter and recomputes the counts.
+ */
+async function fetchAllTechEvents(): Promise<ListTechEventsResponse> {
+  // Fetch both sources in parallel (direct → relay fallback)
+  const [icsText, rssText] = await Promise.all([
+    fetchTextWithRelay(ICS_URL),
+    fetchTextWithRelay(DEV_EVENTS_RSS),
   ]);
 
   let events: TechEvent[] = [];
+  let externalSourcesFailed = 0;
 
   // Parse Techmeme ICS
-  if (icsResponse.status === 'fulfilled' && icsResponse.value.ok) {
-    const icsText = await icsResponse.value.text();
-    events.push(...parseICS(icsText));
+  if (icsText) {
+    const parsed = parseICS(icsText);
+    events.push(...parsed);
+    console.log(`[tech-events] Techmeme ICS: ${parsed.length} events parsed`);
   } else {
-    console.warn('Failed to fetch Techmeme ICS');
+    externalSourcesFailed++;
+    console.warn(`[tech-events] Techmeme ICS: no data (direct + relay both failed)`);
   }
 
   // Parse dev.events RSS
-  if (rssResponse.status === 'fulfilled' && rssResponse.value.ok) {
-    const rssText = await rssResponse.value.text();
+  if (rssText) {
     const devEvents = parseDevEventsRSS(rssText);
     events.push(...devEvents);
+    console.log(`[tech-events] dev.events RSS: ${devEvents.length} events parsed`);
   } else {
-    console.warn('Failed to fetch dev.events RSS');
+    externalSourcesFailed++;
+    console.warn(`[tech-events] dev.events RSS: no data (direct + relay both failed)`);
   }
 
   // Add curated events (major conferences that may fall off limited RSS feeds)
@@ -311,31 +381,15 @@ async function fetchTechEvents(req: ListTechEventsRequest): Promise<ListTechEven
   // Sort by date
   events.sort((a, b) => a.startDate.localeCompare(b.startDate));
 
-  // Filter by type if specified
-  if (type && type !== 'all') {
-    events = events.filter(e => e.type === type);
-  }
-
-  // Filter to only mappable events if requested
-  if (mappable) {
-    events = events.filter(e => e.coords && !e.coords.virtual);
-  }
-
-  // Filter by time range if specified
-  if (days > 0) {
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() + days);
-    events = events.filter(e => new Date(e.startDate) <= cutoff);
-  }
-
-  // Apply limit if specified
-  if (limit > 0) {
-    events = events.slice(0, limit);
-  }
+  // No narrowing here — see the docblock. filterEvents() owns it.
 
   // Add metadata
   const conferences = events.filter(e => e.type === 'conference');
   const mappableCount = conferences.filter(e => e.coords && !e.coords.virtual).length;
+
+  if (externalSourcesFailed > 0) {
+    console.warn(`[tech-events] ${externalSourcesFailed}/${EXTERNAL_SOURCE_COUNT} external sources failed, returning ${events.length} events (curated fallback)`);
+  }
 
   return {
     success: true,
@@ -348,33 +402,141 @@ async function fetchTechEvents(req: ListTechEventsRequest): Promise<ListTechEven
   };
 }
 
-function applyLimit(res: ListTechEventsResponse, limit: number): ListTechEventsResponse {
-  const events = res.events.slice(0, limit);
-  const conferences = events.filter(e => e.type === 'conference');
+// ---------- Geocode + filter ----------
+
+function geocodeEvents(events: TechEvent[]): TechEvent[] {
+  return events.map(e => {
+    if (e.coords) return e;
+    const coords = normalizeLocation(e.location || null);
+    return coords ? { ...e, coords } : e;
+  });
+}
+
+function filterEvents(
+  events: TechEvent[],
+  req: ListTechEventsRequest,
+  pagingPresence: TechEventsPagingPresence,
+): ListTechEventsResponse {
+  const { type, mappable } = req;
+  const { limit, days } = resolveTechEventsPaging(req, pagingPresence);
+
+  let filtered = [...events];
+
+  if (type && type !== 'all') {
+    filtered = TECH_EVENT_TYPES.has(type) ? filtered.filter(e => e.type === type) : [];
+  }
+  if (mappable) {
+    filtered = filtered.filter(e => e.coords && !e.coords.virtual);
+  }
+  if (days > 0) {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() + days);
+    filtered = filtered.filter(e => new Date(e.startDate) <= cutoff);
+  }
+  if (limit > 0) {
+    filtered = filtered.slice(0, limit);
+  }
+
+  const conferences = filtered.filter(e => e.type === 'conference');
   const mappableCount = conferences.filter(e => e.coords && !e.coords.virtual).length;
-  return { ...res, events, count: events.length, conferenceCount: conferences.length, mappableCount };
+
+  return {
+    success: true,
+    count: filtered.length,
+    conferenceCount: conferences.length,
+    mappableCount,
+    lastUpdated: new Date().toISOString(),
+    events: filtered,
+    error: '',
+  };
 }
 
 // ---------- Handler ----------
 
+/**
+ * The cache-miss fetcher, exactly as handed to `cachedFetchJson`.
+ *
+ * Takes no parameters, and neither does `fetchAllTechEvents` beneath it, so
+ * there is no request in this path to narrow by — #5427 is unrepresentable
+ * here rather than merely tested against.
+ *
+ * That is a property of the SHAPE, not a guarantee against every regression:
+ * reintroducing the bug does not require changing this signature, only
+ * ignoring this function and inlining a request-scoped closure at the
+ * `cachedFetchJson` call site. Nothing in the type system stops that, which is
+ * why tests/tech-events-cold-start-widest.test.mts drives `listTechEvents`
+ * end-to-end and asserts on the payload that actually reaches Redis.
+ *
+ * Exported so that behavioural seam stays available to the tests.
+ */
+export async function fetchWidestTechEvents(): Promise<ListTechEventsResponse | null> {
+  const response = await fetchAllTechEvents();
+
+  // Returning null makes cachedFetchJson write a 120s NEG_SENTINEL instead of
+  // a REDIS_CACHE_TTL (6h) payload, so the shared key recovers on the next
+  // request rather than on the seeder's next cycle.
+  //
+  // The test is whether any event actually came from UPSTREAM, not whether a
+  // fetch threw. `CURATED_EVENTS` alone always clears an `events.length > 0`
+  // bar, so a curated-only payload would otherwise be pinned under the
+  // seeder-owned key for 6h and served to every client as `success: true`.
+  // Keying on a fetch-failure counter misses the common shape where a feed
+  // answers HTTP 200 with an error page or an empty calendar: the body clears
+  // fetchTextWithRelay's 100-char floor, so the fetch "succeeded" while
+  // parsing yields nothing. Both shapes collapse to the same question --
+  // did upstream give us anything? -- so ask that directly.
+  //
+  // This is the Seed-Owned Key contract in CONCEPTS.md: a reader answers a
+  // miss with a short-TTL fallback and never poisons the key with a degraded
+  // payload.
+  //
+  // A PARTIAL fetch still caches: one live feed is materially complete
+  // (~26 or ~100 events), and refusing it would drop every caller into the
+  // empty-response window for as long as the other feed stayed down.
+  const hasUpstreamData = response.events.some(e => e.source !== 'curated');
+  return hasUpstreamData ? response : null;
+}
+
 export async function listTechEvents(
-  _ctx: ServerContext,
+  ctx: ServerContext,
   req: ListTechEventsRequest,
 ): Promise<ListTechEventsResponse> {
   try {
-    const cacheKey = `${REDIS_CACHE_KEY}:${req.type || 'all'}:${req.mappable ? 1 : 0}:${req.days || 0}`;
-    const result = await cachedFetchJson<ListTechEventsResponse>(cacheKey, REDIS_CACHE_TTL, async () => {
-      const fetched = await fetchTechEvents({ ...req, limit: 0 });
-      return fetched.events.length > 0 ? fetched : null;
-    });
-    if (!result) {
-      return { success: true, count: 0, conferenceCount: 0, mappableCount: 0, lastUpdated: new Date().toISOString(), events: [], error: '' };
+    const pagingPresence = readTechEventsPagingPresence(ctx);
+
+    // Primary: read from seed-populated Redis key (Railway relay seeds this every 6h).
+    // The cold-start fallback is request-independent by construction — see
+    // fetchWidestTechEvents. Per-request narrowing happens in filterEvents()
+    // below, never in what gets cached under the shared key.
+    const result = await cachedFetchJson<ListTechEventsResponse>(
+      REDIS_CACHE_KEY,
+      REDIS_CACHE_TTL,
+      fetchWidestTechEvents,
+    );
+
+    // No data at all: the seeder has not populated the key and the cold-start
+    // fetch found nothing upstream. This is NOT the same as "your filters
+    // matched nothing" -- that case flows through filterEvents() below and
+    // legitimately returns count 0 with an empty `error`.
+    //
+    // The non-empty `error` is load-bearing, not decoration: the gateway reads
+    // it via getRpcNoStoreReasonFromJson (server/gateway.ts:1933) and answers
+    // `Cache-Control: no-store`. Without it this route falls to its 'daily'
+    // tier (gateway.ts:265 -> s-maxage=14400), so an outage that Redis now
+    // shrugs off in 120s would instead sit at the shared CDN edge for 4h.
+    // It also lets a client tell "upstream is down" from "no events found".
+    //
+    // `success` stays true because the RPC itself did not fail; a dedicated
+    // `dataAvailable`/`upstreamUnavailable` proto field (as consumer-prices
+    // and natural-events have) would model this better than overloading
+    // `error`, but that needs a schema change beyond this fix.
+    if (!result || result.events.length === 0) {
+      return { success: true, count: 0, conferenceCount: 0, mappableCount: 0, lastUpdated: new Date().toISOString(), events: [], error: TECH_EVENTS_UNAVAILABLE_ERROR };
     }
-    const limit = clampInt(req.limit, 50, 1, 200);
-    if (result.events.length > limit) {
-      return applyLimit(result, limit);
-    }
-    return result;
+
+    // Apply geocoding (seed stores events without coords) and filter by request params
+    const geocoded = geocodeEvents(result.events);
+    return filterEvents(geocoded, req, pagingPresence);
   } catch (error) {
     return {
       success: false,

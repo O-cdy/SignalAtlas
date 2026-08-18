@@ -8,10 +8,18 @@ import type {
     AirportRef,
 } from '../../../../src/generated/server/worldmonitor/aviation/v1/service_server';
 import { cachedFetchJson } from '../../../_shared/redis';
-import { CHROME_UA } from '../../../_shared/constants';
-import { AVIATIONSTACK_URL } from './_shared';
+import { markNoCacheResponse } from '../../../_shared/response-headers';
+import { getRelayBaseUrl, getRelayHeaders } from './_shared';
+import { aviationStackBudgetMonth, reserveAviationStackCalls } from './_avstack-budget';
 
 const CACHE_TTL = 300;
+// Always fetch a full page upstream and cache it once per airport+direction,
+// then slice to the caller's requested limit in memory. Threading req.limit
+// into the cache key (and the upstream query) meant limit 30 vs 31 vs 50 were
+// separate PAID AviationStack calls for identical data — a cache-key explosion
+// that multiplied spend. The page covers any limit ≤ 100.
+const UPSTREAM_PAGE = 100;
+const IATA_RE = /^[A-Z]{3}$/;
 
 interface AVSFlight {
     flight?: { iata?: string; icao?: string; codeshared?: { flight_iata?: string; airline_iata?: string }[] };
@@ -88,88 +96,60 @@ function normalizeFlights(flights: AVSFlight[], now: number): FlightInstance[] {
     });
 }
 
-function buildSimulatedFlights(airport: string, direction: string, limit: number, now: number): FlightInstance[] {
-    const destinations = { IST: ['LHR', 'FRA', 'CDG', 'AMS', 'MAD'], LHR: ['IST', 'JFK', 'FRA', 'SIN'], FRA: ['IST', 'LHR', 'CDG', 'JFK'] };
-    const origins = (destinations as Record<string, string[]>)[airport] ?? ['LHR', 'FRA', 'CDG'];
-    const carriers = [
-        { iataCode: 'TK', icaoCode: 'THY', name: 'Turkish Airlines' },
-        { iataCode: 'LH', icaoCode: 'DLH', name: 'Lufthansa' },
-        { iataCode: 'BA', icaoCode: 'BAW', name: 'British Airways' },
-    ];
 
-    const flights: FlightInstance[] = [];
-    const count = Math.min(limit, 10);
-
-    for (let i = 0; i < count; i++) {
-        const isArr = direction === 'FLIGHT_DIRECTION_ARRIVAL' || (direction === 'FLIGHT_DIRECTION_BOTH' && i % 2 === 0);
-        const other = origins[i % origins.length]!;
-        const carrier = carriers[i % carriers.length]!;
-        const schedTime = now + (isArr ? -1 : 1) * (30 + i * 25) * 60_000;
-        const delayed = i === 1 || i === 4;
-        const delayMin = delayed ? 20 + Math.floor(Math.random() * 40) : 0;
-
-        flights.push({
-            flightNumber: `${carrier.iataCode}${1000 + i * 17}`,
-            date: new Date(schedTime).toISOString().slice(0, 10),
-            operatingCarrier: carrier,
-            origin: isArr ? { iata: other, icao: '', name: other, timezone: 'UTC' } : { iata: airport, icao: '', name: airport, timezone: 'UTC' },
-            destination: isArr ? { iata: airport, icao: '', name: airport, timezone: 'UTC' } : { iata: other, icao: '', name: other, timezone: 'UTC' },
-            scheduledDeparture: isArr ? 0 : schedTime,
-            estimatedDeparture: isArr ? 0 : schedTime + delayMin * 60_000,
-            actualDeparture: 0,
-            scheduledArrival: isArr ? schedTime : 0,
-            estimatedArrival: isArr ? schedTime + delayMin * 60_000 : 0,
-            actualArrival: 0,
-            status: 'FLIGHT_INSTANCE_STATUS_SCHEDULED',
-            delayMinutes: delayMin,
-            cancelled: false,
-            diverted: false,
-            gate: `${String.fromCharCode(65 + (i % 5))}${10 + i}`,
-            terminal: String(1 + (i % 3)),
-            aircraftIcao24: '',
-            aircraftType: 'B738',
-            codeshareFlightNumbers: [],
-            source: 'simulated',
-            updatedAt: now,
-        });
-    }
-
-    return flights;
-}
-
+// Response-level source values (ListAirportFlightsResponse.source):
+//   'aviationstack' — live data from AviationStack via relay
+//   'none'          — relay not configured; flights = [] (no-store, negative cached)
+//   'error'         — relay fetch failed; flights = [] (no-store, negative cached)
+//   'invalid'       — malformed airport code; rejected before any paid call
+//   'budget'        — monthly AviationStack budget reached; serving empty (no-store, negative cached)
 export async function listAirportFlights(
-    _ctx: ServerContext,
+    ctx: ServerContext,
     req: ListAirportFlightsRequest,
 ): Promise<ListAirportFlightsResponse> {
     const airport = req.airport?.toUpperCase() || 'IST';
     const direction = req.direction || 'FLIGHT_DIRECTION_BOTH';
     const limit = Math.min(req.limit || 30, 100);
-    const cacheKey = `aviation:flights:${airport}:${direction}:${limit}:v1`;
     const now = Date.now();
 
+    // Reject malformed airport codes before they reach the paid API — bounds
+    // cache-key cardinality and blocks probing with arbitrary strings.
+    if (!IATA_RE.test(airport)) {
+        return { flights: [], totalAvailable: 0, source: 'invalid', updatedAt: now };
+    }
+
+    // Cache key is limit-independent (see UPSTREAM_PAGE) — one upstream call
+    // serves every limit for this airport+direction.
+    const cacheKey = `aviation:flights:${airport}:${direction}:v2:${aviationStackBudgetMonth()}`;
+    let unavailableSource = 'unavailable';
+
     try {
-        const result = await cachedFetchJson<{ flights: FlightInstance[]; source: string }>(
+        const result = await cachedFetchJson<{ flights: FlightInstance[]; source: 'aviationstack' }>(
             cacheKey, CACHE_TTL, async () => {
-                const apiKey = process.env.AVIATIONSTACK_API;
-                if (!apiKey) {
-                    return { flights: buildSimulatedFlights(airport, direction, limit, now), source: 'simulated' };
+                const relayBase = getRelayBaseUrl();
+                if (!relayBase) {
+                    unavailableSource = 'none';
+                    return null;
                 }
 
-                // TODO: FLIGHT_DIRECTION_BOTH only fetches departures (dep_iata). To support true
-                // bidirectional results, two parallel calls (dep_iata + arr_iata at limit/2 each)
-                // would be needed — deferred due to AviationStack rate-limit cost.
+                // Monthly quota guard: negative-cache the unavailable state
+                // instead of positive-caching an empty flight board.
+                if (!(await reserveAviationStackCalls(1, 'request'))) {
+                    unavailableSource = 'budget';
+                    return null;
+                }
+
                 const paramKey = direction === 'FLIGHT_DIRECTION_ARRIVAL' ? 'arr_iata' : 'dep_iata';
                 const params = new URLSearchParams({
-                    access_key: apiKey,
                     [paramKey]: airport,
-                    limit: String(limit),
+                    limit: String(UPSTREAM_PAGE),
                 });
-                const url = `${AVIATIONSTACK_URL}?${params}`;
+                const url = `${relayBase}/aviationstack?${params}`;
 
                 try {
                     const resp = await fetch(url, {
-                        headers: { 'User-Agent': CHROME_UA },
-                        signal: AbortSignal.timeout(10_000),
+                        headers: getRelayHeaders(),
+                        signal: AbortSignal.timeout(15_000),
                     });
                     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                     const json = await resp.json() as { data?: AVSFlight[]; error?: { message?: string } };
@@ -177,21 +157,33 @@ export async function listAirportFlights(
                     const flights = normalizeFlights(json.data ?? [], now);
                     return { flights, source: 'aviationstack' };
                 } catch (err) {
-                    console.warn(`[Aviation] Flights fetch failed for ${airport}: ${err instanceof Error ? err.message : err}`);
-                    return { flights: buildSimulatedFlights(airport, direction, limit, now), source: 'simulated' };
+                    console.warn(`[Aviation] Flights relay fetch failed for ${airport}: ${err instanceof Error ? err.message : err}`);
+                    unavailableSource = 'error';
+                    return null;
                 }
             }
         );
 
-        const flights = result?.flights ?? [];
+        if (!result) {
+            markNoCacheResponse(ctx.request);
+            return {
+                flights: [],
+                totalAvailable: 0,
+                source: unavailableSource,
+                updatedAt: now,
+            };
+        }
+
+        const flights = result.flights;
         return {
             flights: flights.slice(0, limit),
             totalAvailable: flights.length,
-            source: result?.source ?? 'unknown',
+            source: result.source,
             updatedAt: now,
         };
     } catch (err) {
         console.warn(`[Aviation] ListAirportFlights error: ${err instanceof Error ? err.message : err}`);
+        markNoCacheResponse(ctx.request);
         return { flights: [], totalAvailable: 0, source: 'error', updatedAt: now };
     }
 }

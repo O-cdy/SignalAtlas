@@ -8,6 +8,8 @@
  * - Unknown errors -- 500 Internal Server Error
  */
 
+import { isBillingVerificationCode } from './_shared/entitlement-check';
+
 /**
  * Detects network/fetch errors across runtimes. Per Fetch spec, network
  * errors throw TypeError. We also check common error message patterns
@@ -16,12 +18,7 @@
 function isNetworkError(error: unknown): boolean {
   if (!(error instanceof TypeError)) return false;
   const msg = error.message.toLowerCase();
-  return msg.includes('fetch') ||
-    msg.includes('network') ||
-    msg.includes('connect') ||
-    msg.includes('econnrefused') ||
-    msg.includes('enotfound') ||
-    msg.includes('socket');
+  return msg.includes('fetch') || msg.includes('network') || msg.includes('connect') || msg.includes('econnrefused') || msg.includes('enotfound') || msg.includes('socket');
 }
 
 /**
@@ -29,20 +26,42 @@ function isNetworkError(error: unknown): boolean {
  * Matches the `ServerOptions.onError` signature:
  *   (error: unknown, req: Request) => Response | Promise<Response>
  */
+function jsonMessageResponse(message: string, status: number, extras?: Record<string, unknown>, headers?: Record<string, string>): Response {
+  return new Response(JSON.stringify({ message, ...(extras ?? {}) }), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...(headers ?? {}) },
+  });
+}
+
 export function mapErrorToResponse(error: unknown, _req: Request): Response {
   // ApiError: has statusCode property (e.g., upstream returns 429, 403, etc.)
   if (error instanceof Error && 'statusCode' in error) {
     const statusCode = (error as Error & { statusCode: number }).statusCode;
     // Only expose error.message for 4xx (client errors). Use generic message for 5xx
     // to avoid leaking internal details like upstream URLs or API key fragments (H-3 fix).
-    const message = statusCode >= 400 && statusCode < 500
-      ? error.message
-      : 'Internal server error';
-    const body: Record<string, unknown> = { message };
+    const retryAfter = (statusCode === 429 || statusCode === 503) && 'retryAfter' in error ? Number((error as Error & { retryAfter: number }).retryAfter) : null;
+    const billingCodeCandidate = 'billingVerificationCode' in error
+      ? (error as Error & { billingVerificationCode: unknown }).billingVerificationCode
+      : null;
+    const billingVerificationCode = isBillingVerificationCode(billingCodeCandidate)
+      ? billingCodeCandidate
+      : null;
+    const exposesRetryableUnavailable = statusCode === 503
+      && retryAfter != null
+      && Number.isFinite(retryAfter)
+      && (error as Error & { exposeMessage?: boolean }).exposeMessage === true;
+    const message = (statusCode >= 400 && statusCode < 500) || exposesRetryableUnavailable ? error.message : 'Internal server error';
+    const extras: Record<string, unknown> = {};
+    const headers: Record<string, string> = {};
 
     // Rate limit: include retryAfter if present
-    if (statusCode === 429 && 'retryAfter' in error) {
-      body.retryAfter = (error as Error & { retryAfter: number }).retryAfter;
+    if (retryAfter != null && Number.isFinite(retryAfter)) {
+      extras.retryAfter = retryAfter;
+      headers['Retry-After'] = String(retryAfter);
+    }
+    if (billingVerificationCode) {
+      extras.code = billingVerificationCode;
+      headers['X-Billing-Verification'] = billingVerificationCode;
     }
 
     if (statusCode >= 500) {
@@ -51,33 +70,26 @@ export function mapErrorToResponse(error: unknown, _req: Request): Response {
       console.error(`[error-mapper] ${statusCode}:`, error.message, apiBody ? `| body: ${apiBody}` : '');
     }
 
-    return new Response(JSON.stringify(body), {
-      status: statusCode,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return jsonMessageResponse(
+      message,
+      statusCode,
+      Object.keys(extras).length > 0 ? extras : undefined,
+      Object.keys(headers).length > 0 ? headers : undefined,
+    );
   }
 
   // JSON parse errors from req.json() on malformed/empty POST body → 400 not 500
   if (error instanceof SyntaxError) {
-    return new Response(JSON.stringify({ message: 'Invalid request body' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return jsonMessageResponse('Invalid request body', 400);
   }
 
   // Network/fetch errors: upstream is unreachable (M-5 fix: runtime-agnostic detection)
   if (isNetworkError(error)) {
     console.error('[error-mapper] Network error (502):', (error as Error).message);
-    return new Response(JSON.stringify({ message: 'Upstream unavailable' }), {
-      status: 502,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return jsonMessageResponse('Upstream unavailable', 502);
   }
 
   // Catch-all: 500 Internal Server Error
   console.error('[error-mapper] Unhandled error:', error instanceof Error ? error.message : error);
-  return new Response(JSON.stringify({ message: 'Internal server error' }), {
-    status: 500,
-    headers: { 'Content-Type': 'application/json' },
-  });
+  return jsonMessageResponse('Internal server error', 500);
 }

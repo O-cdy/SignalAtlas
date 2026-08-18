@@ -1,10 +1,36 @@
 import { isDesktopRuntime } from '../services/runtime';
 import { invokeTauri } from '../services/tauri-bridge';
 import { t } from '../services/i18n';
-import { h, replaceChildren, safeHtml } from '../utils/dom-utils';
+import { type DomChild, h, replaceChildren, safeHtml as sanitizeHtmlFragment, setTrustedHtml, trustedHtml, type TrustedHtml } from '../utils/dom-utils';
+import { safeHtmlToString, type SafeHtml } from '@/utils/sanitize';
 import { trackPanelResized } from '@/services/analytics';
 import { getAiFlowSettings } from '@/services/ai-flow-settings';
 import { getSecretState } from '@/services/runtime-config';
+import { PanelGateReason } from '@/services/panel-gating';
+import { openExternalUrl } from '@/services/external-navigation';
+import { lockSvg, upgradeSvg } from '@/components/gate-icons';
+import { dataFreshness, type PanelFreshnessSummary } from '@/services/data-freshness';
+import { formatPanelFreshnessDisplay } from '@/services/panel-freshness-display';
+import {
+  clearPanelColSpan,
+  clearPanelSpan,
+  loadPanelCollapsed,
+  loadPanelColSpans,
+  loadPanelSpans,
+  savePanelCollapsed,
+  savePanelColSpan,
+  savePanelSpan,
+} from '@/utils/panel-storage';
+import {
+  clampColSpan,
+  clearColSpanClass,
+  getExplicitColSpanClass,
+  getMaxColSpan,
+  isPanelGridColumnCountReady,
+  setColSpanClass,
+} from '@/utils/panel-grid';
+
+export type PanelSeverity = 'critical' | 'high' | 'medium' | 'low' | 'none';
 
 export interface PanelOptions {
   id: string;
@@ -14,102 +40,21 @@ export interface PanelOptions {
   trackActivity?: boolean;
   infoTooltip?: string;
   premium?: 'locked' | 'enhanced';
+  closable?: boolean;
+  collapsible?: boolean;
+  defaultRowSpan?: number;
 }
 
-const PANEL_SPANS_KEY = 'worldmonitor-panel-spans';
-
-function loadPanelSpans(): Record<string, number> {
-  try {
-    const stored = localStorage.getItem(PANEL_SPANS_KEY);
-    return stored ? JSON.parse(stored) : {};
-  } catch {
-    return {};
-  }
-}
-
-function savePanelSpan(panelId: string, span: number): void {
-  const spans = loadPanelSpans();
-  spans[panelId] = span;
-  localStorage.setItem(PANEL_SPANS_KEY, JSON.stringify(spans));
-}
-
-const PANEL_COL_SPANS_KEY = 'worldmonitor-panel-col-spans';
 const ROW_RESIZE_STEP_PX = 80;
 const COL_RESIZE_STEP_PX = 80;
-const PANELS_GRID_MIN_TRACK_PX = 280;
-
-function loadPanelColSpans(): Record<string, number> {
-  try {
-    const stored = localStorage.getItem(PANEL_COL_SPANS_KEY);
-    return stored ? JSON.parse(stored) : {};
-  } catch {
-    return {};
-  }
-}
-
-function savePanelColSpan(panelId: string, span: number): void {
-  const spans = loadPanelColSpans();
-  spans[panelId] = span;
-  localStorage.setItem(PANEL_COL_SPANS_KEY, JSON.stringify(spans));
-}
-
-function clearPanelColSpan(panelId: string): void {
-  const spans = loadPanelColSpans();
-  if (!(panelId in spans)) return;
-  delete spans[panelId];
-  if (Object.keys(spans).length === 0) {
-    localStorage.removeItem(PANEL_COL_SPANS_KEY);
-    return;
-  }
-  localStorage.setItem(PANEL_COL_SPANS_KEY, JSON.stringify(spans));
-}
+const FRESHNESS_BADGE_REFRESH_MS = 60_000;
 
 function getDefaultColSpan(element: HTMLElement): number {
   return element.classList.contains('panel-wide') ? 2 : 1;
 }
 
 function getColSpan(element: HTMLElement): number {
-  if (element.classList.contains('col-span-3')) return 3;
-  if (element.classList.contains('col-span-2')) return 2;
-  if (element.classList.contains('col-span-1')) return 1;
-  return getDefaultColSpan(element);
-}
-
-function getGridColumnCount(element: HTMLElement): number {
-  const grid = (element.closest('.panels-grid') || element.closest('.map-bottom-grid')) as HTMLElement | null;
-  if (!grid) return 3;
-  const style = window.getComputedStyle(grid);
-  const template = style.gridTemplateColumns;
-  if (!template || template === 'none') return 3;
-
-  if (template.includes('repeat(')) {
-    const repeatCountMatch = template.match(/repeat\(\s*(\d+)\s*,/i);
-    if (repeatCountMatch) {
-      const parsed = Number.parseInt(repeatCountMatch[1] ?? '0', 10);
-      if (Number.isFinite(parsed) && parsed > 0) return parsed;
-    }
-
-    // For repeat(auto-fill/auto-fit, minmax(...)), infer count from rendered width.
-    const autoRepeatMatch = template.match(/repeat\(\s*auto-(fill|fit)\s*,/i);
-    if (autoRepeatMatch) {
-      const gap = Number.parseFloat(style.columnGap || '0') || 0;
-      const width = grid.getBoundingClientRect().width;
-      if (width > 0) {
-        return Math.max(1, Math.floor((width + gap) / (PANELS_GRID_MIN_TRACK_PX + gap)));
-      }
-    }
-  }
-
-  const columns = template.trim().split(/\s+/).filter(Boolean);
-  return columns.length > 0 ? columns.length : 3;
-}
-
-function getMaxColSpan(element: HTMLElement): number {
-  return Math.max(1, Math.min(3, getGridColumnCount(element)));
-}
-
-function clampColSpan(span: number, maxSpan: number): number {
-  return Math.max(1, Math.min(maxSpan, span));
+  return getExplicitColSpanClass(element) ?? getDefaultColSpan(element);
 }
 
 function persistPanelColSpan(panelId: string, element: HTMLElement): void {
@@ -132,20 +77,16 @@ function deltaToColSpan(startSpan: number, deltaX: number, maxSpan = 3): number 
   return clampColSpan(startSpan + spanDelta, maxSpan);
 }
 
-function clearColSpanClass(element: HTMLElement): void {
-  element.classList.remove('col-span-1', 'col-span-2', 'col-span-3');
-}
-
-function setColSpanClass(element: HTMLElement, span: number): void {
-  clearColSpanClass(element);
-  element.classList.add(`col-span-${span}`);
-}
-
 function getRowSpan(element: HTMLElement): number {
   if (element.classList.contains('span-4')) return 4;
   if (element.classList.contains('span-3')) return 3;
   if (element.classList.contains('span-2')) return 2;
-  return 1;
+  if (element.classList.contains('span-1')) return 1;
+  // A natural wide panel already occupies two dashboard rows even when it
+  // has no explicit span-N class. Treat that footprint as the resize baseline
+  // so the first vertical drag changes the visible height instead of being a
+  // no-op against the existing grid-row: span 2 rule.
+  return element.classList.contains('panel-wide') ? 2 : 1;
 }
 
 function deltaToRowSpan(startSpan: number, deltaY: number): number {
@@ -168,6 +109,11 @@ export class Panel {
   protected countEl: HTMLElement | null = null;
   protected statusBadgeEl: HTMLElement | null = null;
   protected newBadgeEl: HTMLElement | null = null;
+  private freshnessBadgeEl: HTMLElement | null = null;
+  private freshnessUnsubscribe: (() => void) | null = null;
+  private freshnessRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  private severityDotEl: HTMLElement | null = null;
+  private currentSeverity: PanelSeverity = 'none';
   protected panelId: string;
   private abortController: AbortController = new AbortController();
   private tooltipCloseHandler: (() => void) | null = null;
@@ -195,12 +141,46 @@ export class Panel {
   private colSpanReconcileRaf: number | null = null;
   private readonly contentDebounceMs = 150;
   private pendingContentHtml: string | null = null;
+  /**
+   * The exact string last written by `setContentImmediate`, or `null` when the
+   * content was replaced by any other path (loading/error/locked states, clear,
+   * saved-content restore) and is therefore no longer a known string.
+   *
+   * Exists to keep the two content dirty-checks off `this.content.innerHTML`:
+   * reading that getter serializes the whole panel subtree to a string, and it
+   * was read twice per update — once to decide whether to schedule the write and
+   * again to decide whether to perform it. Panels re-render on every data tick,
+   * so that serialization was pure overhead on the render path. `null` compares
+   * unequal to any candidate, so an unknown state always falls through to a
+   * write — the safe direction.
+   */
+  private lastCommittedHtml: string | null = null;
   private contentDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingContentCallback: (() => void) | null = null;
   private retryCallback: (() => void) | null = null;
   private retryCountdownTimer: ReturnType<typeof setInterval> | null = null;
   private retryAttempt = 0;
   private _fetching = false;
   private _locked = false;
+  // Last reason rendered by showGatedCta, so repeat gating passes with an
+  // unchanged verdict skip the DOM teardown/rebuild (#4771 re-runs gating on
+  // every subscription-row change, including fields irrelevant to gating).
+  private _lastGateReason: PanelGateReason | null = null;
+  // Snapshot of this.content's children at the moment showLocked /
+  // showGatedCta replaces them with a lock CTA. unlockPanel re-attaches
+  // these nodes so subclasses whose UI is constructed once (typically in
+  // the ctor — chips, input rows, static chrome) don't end up with a
+  // permanently empty body after a FREE→PRO auth-state cycle. The cache
+  // holds the actual DOM nodes; reattaching preserves any listeners and
+  // any subclass references like `this.inputEl`.
+  private _savedContent: ChildNode[] | null = null;
+  private _collapsed = false;
+  private _collapseBtn: HTMLButtonElement | null = null;
+  private viewportObserver: IntersectionObserver | null = null;
+  private viewportObserverRegistered = false;
+  private connectedCallbacks: Array<() => void> = [];
+  private connectedFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+  private destroyed = false;
 
   constructor(options: PanelOptions) {
     this.panelId = options.id;
@@ -219,11 +199,29 @@ export class Panel {
     title.textContent = options.title;
     headerLeft.appendChild(title);
 
+    this.severityDotEl = document.createElement('span');
+    this.severityDotEl.className = 'panel-severity-dot';
+    this.severityDotEl.setAttribute('aria-hidden', 'true');
+    headerLeft.appendChild(this.severityDotEl);
+
+    const initialFreshness = dataFreshness.getPanelFreshness(this.panelId);
+    if (initialFreshness) {
+      this.freshnessBadgeEl = document.createElement('span');
+      this.freshnessBadgeEl.className = 'panel-freshness-badge';
+      headerLeft.appendChild(this.freshnessBadgeEl);
+      this.updateFreshnessBadge(initialFreshness);
+      this.freshnessUnsubscribe = dataFreshness.subscribe(() => this.updateFreshnessBadge());
+      this.freshnessRefreshTimer = setInterval(
+        () => this.updateFreshnessBadge(),
+        FRESHNESS_BADGE_REFRESH_MS,
+      );
+    }
+
     if (options.infoTooltip) {
       const infoBtn = h('button', { className: 'panel-info-btn', 'aria-label': t('components.panel.showMethodologyInfo') }, '?');
 
       const tooltip = h('div', { className: 'panel-info-tooltip' });
-      tooltip.appendChild(safeHtml(options.infoTooltip));
+      tooltip.appendChild(sanitizeHtmlFragment(options.infoTooltip));
 
       infoBtn.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -248,7 +246,7 @@ export class Panel {
       headerLeft.appendChild(this.newBadgeEl);
     }
 
-    if (options.premium === 'enhanced' && !getSecretState('WORLDMONITOR_API_KEY').present) {
+    if (options.premium && !getSecretState('WORLDMONITOR_API_KEY').present) {
       const proBadge = h('span', { className: 'panel-pro-badge' }, t('premium.pro'));
       headerLeft.appendChild(proBadge);
     }
@@ -267,12 +265,24 @@ export class Panel {
       this.header.appendChild(this.countEl);
     }
 
+    if (options.collapsible) {
+      this.appendCollapseButton();
+    }
+
+    if (options.closable !== false) {
+      this.appendCloseButton();
+    }
+
     this.content = document.createElement('div');
     this.content.className = 'panel-content';
     this.content.id = `${options.id}Content`;
 
     this.element.appendChild(this.header);
     this.element.appendChild(this.content);
+
+    if (this._collapseBtn && loadPanelCollapsed()[this.panelId]) {
+      this._applyCollapsed(this._collapseBtn, true);
+    }
 
     this.content.addEventListener('click', (e) => {
       const target = (e.target as HTMLElement).closest('[data-panel-retry]');
@@ -294,10 +304,15 @@ export class Panel {
     this.element.appendChild(this.colResizeHandle);
     this.setupColResizeHandlers();
 
-    // Restore saved span
+    // Apply default row span (before restore, so saved preferences win)
+    if (options.defaultRowSpan && options.defaultRowSpan > 1) {
+      this.element.classList.add(`span-${options.defaultRowSpan}`);
+    }
+
+    // Restore saved span (overrides default)
     const savedSpans = loadPanelSpans();
     const savedSpan = savedSpans[this.panelId];
-    if (savedSpan && savedSpan > 1) {
+    if (savedSpan !== undefined) {
       setSpanClass(this.element, savedSpan);
     }
 
@@ -334,8 +349,11 @@ export class Panel {
     }
 
     const tryReconcile = (remaining: number) => {
-      if (!this.element.isConnected || !this.element.parentElement) {
-        if (remaining <= 0) return;
+      if (!this.element.isConnected || !this.element.parentElement || !isPanelGridColumnCountReady(this.element)) {
+        if (remaining <= 0) {
+          this.colSpanReconcileRaf = null;
+          return;
+        }
         this.colSpanReconcileRaf = requestAnimationFrame(() => tryReconcile(remaining - 1));
         return;
       }
@@ -616,7 +634,16 @@ export class Panel {
   }
 
 
-  protected setDataBadge(state: 'live' | 'cached' | 'unavailable', detail?: string): void {
+  /**
+   * `detailTitle` explains a `detail` the badge is too small to justify on its
+   * own (e.g. a partial source count). Cleared when absent so a stale
+   * explanation can't outlive the detail it described.
+   */
+  protected setDataBadge(
+    state: 'live' | 'cached' | 'unavailable',
+    detail?: string,
+    detailTitle?: string,
+  ): void {
     if (!this.statusBadgeEl) return;
     const labels = {
       live: t('common.live'),
@@ -625,6 +652,13 @@ export class Panel {
     } as const;
     this.statusBadgeEl.textContent = detail ? `${labels[state]} · ${detail}` : labels[state];
     this.statusBadgeEl.className = `panel-data-badge ${state}`;
+    if (detailTitle) {
+      this.statusBadgeEl.title = detailTitle;
+      this.statusBadgeEl.setAttribute('aria-label', detailTitle);
+    } else {
+      this.statusBadgeEl.removeAttribute('title');
+      this.statusBadgeEl.removeAttribute('aria-label');
+    }
     this.statusBadgeEl.style.display = 'inline-flex';
   }
 
@@ -632,14 +666,220 @@ export class Panel {
     if (!this.statusBadgeEl) return;
     this.statusBadgeEl.style.display = 'none';
   }
+
+  private updateFreshnessBadge(summary: PanelFreshnessSummary | null = dataFreshness.getPanelFreshness(this.panelId)): void {
+    if (!this.freshnessBadgeEl) return;
+    if (!summary) {
+      this.freshnessBadgeEl.style.display = 'none';
+      return;
+    }
+    const display = formatPanelFreshnessDisplay(summary);
+    this.freshnessBadgeEl.textContent = display.label;
+    this.freshnessBadgeEl.className = `panel-freshness-badge panel-freshness-${summary.status}`;
+    this.freshnessBadgeEl.title = display.title;
+    this.freshnessBadgeEl.setAttribute('aria-label', display.ariaLabel);
+    this.freshnessBadgeEl.style.display = 'inline-flex';
+  }
+
+  protected insertLiveCountBadge(count: number): void {
+    const headerLeft = this.header.querySelector('.panel-header-left');
+    if (!headerLeft) return;
+    const badge = document.createElement('span');
+    badge.className = 'panel-live-count';
+    badge.textContent = `${count}`;
+    headerLeft.appendChild(badge);
+  }
+
+  private _applyCollapsed(btn: HTMLButtonElement, collapsed: boolean): void {
+    this._collapsed = collapsed;
+    this.content.style.display = collapsed ? 'none' : '';
+    this.element.classList.toggle('panel-collapsed', collapsed);
+    btn.textContent = collapsed ? '▸' : '▾';
+    const label = collapsed
+      ? (t('components.panel.expandPanel') ?? 'Expand')
+      : (t('components.panel.collapsePanel') ?? 'Collapse');
+    btn.setAttribute('aria-expanded', String(!collapsed));
+    btn.setAttribute('aria-label', label);
+    btn.title = label;
+  }
+
+  protected appendCollapseButton(): void {
+    const btn = h('button', {
+      className: 'icon-btn panel-collapse-btn',
+      'aria-label': t('components.panel.collapsePanel') ?? 'Collapse',
+      'aria-expanded': 'true',
+      title: t('components.panel.collapsePanel') ?? 'Collapse',
+    }, '▾') as HTMLButtonElement;
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this._applyCollapsed(btn, !this._collapsed);
+      savePanelCollapsed(this.panelId, this._collapsed);
+    });
+    this._collapseBtn = btn;
+    this.header.appendChild(btn);
+  }
+
+  protected appendCloseButton(): void {
+    const closeBtn = h('button', {
+      className: 'icon-btn panel-close-btn',
+      'aria-label': t('components.panel.closePanel'),
+      title: t('components.panel.closePanel'),
+    }, '\u2715');
+    closeBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.element.dispatchEvent(new CustomEvent('wm:panel-close', {
+        bubbles: true,
+        detail: { panelId: this.panelId },
+      }));
+    });
+    this.header.appendChild(closeBtn);
+  }
+
   public getElement(): HTMLElement {
     return this.element;
   }
 
+  /**
+   * True when this panel can host live media right now: attached, enabled (not hidden via the
+   * disable path), and expanded (not collapsed). The play-all cascade gates on this so a
+   * collapsed or disabled panel never creates/queues media work inside a hidden content area.
+   */
+  public canHostLiveMedia(): boolean {
+    return this.element.isConnected
+      && !this.element.classList.contains('hidden')
+      && !this._collapsed;
+  }
+
+  protected runWhenConnected(callback: () => void): boolean {
+    if (this.destroyed) return false;
+    if (this.element.isConnected) {
+      callback();
+      return true;
+    }
+
+    this.connectedCallbacks.push(callback);
+    this.scheduleConnectedFallbackIfNeeded();
+    return false;
+  }
+
+  public notifyConnected(): void {
+    this.flushConnectedCallbacks();
+  }
+
+  private scheduleConnectedFallbackIfNeeded(): void {
+    // Modern dashboard mounts call notifyConnected() from panel-layout. The timer is
+    // only for old/no-MutationObserver environments where that signal may not exist.
+    if (this.connectedFallbackTimer !== null || typeof MutationObserver !== 'undefined') return;
+    this.connectedFallbackTimer = globalThis.setTimeout(() => {
+      this.connectedFallbackTimer = null;
+      if (this.destroyed || this.connectedCallbacks.length === 0) return;
+      if (this.element.isConnected) {
+        this.flushConnectedCallbacks();
+        return;
+      }
+      this.scheduleConnectedFallbackIfNeeded();
+    }, 50);
+  }
+
+  private flushConnectedCallbacks(): void {
+    if (this.destroyed || !this.element.isConnected || this.connectedCallbacks.length === 0) return;
+    const callbacks = this.connectedCallbacks.splice(0);
+    if (this.connectedFallbackTimer !== null) {
+      clearTimeout(this.connectedFallbackTimer);
+      this.connectedFallbackTimer = null;
+    }
+
+    const errors: unknown[] = [];
+    for (const cb of callbacks) {
+      try {
+        cb();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length === 1) {
+      globalThis.setTimeout(() => { throw errors[0]; }, 0);
+    } else if (errors.length > 1) {
+      const error = new Error('Panel connected callbacks failed') as Error & { errors?: unknown[] };
+      error.errors = errors;
+      globalThis.setTimeout(() => { throw error; }, 0);
+    }
+  }
+
+  /**
+   * Fire `callback` once when this panel's element scrolls within
+   * `marginPx` of the viewport. Uses IntersectionObserver where
+   * available; falls back to an idle-callback tick when not (Node/SSR
+   * or very old browsers). Idempotent — repeat calls are ignored
+   * once an observation is registered. Disconnected automatically on
+   * destroy() and on first firing (loadAllData is idempotent and the
+   * refresh scheduler owns repeat fetches, so re-firing is wasted
+   * work). (#3990)
+   */
+  public observeNearViewport(callback: () => void, marginPx = 200): void {
+    if (this.viewportObserverRegistered) return;
+    if (typeof IntersectionObserver === 'undefined' || typeof window === 'undefined') {
+      this.viewportObserverRegistered = true;
+      const tick = (): void => {
+        if (this.element.isConnected) callback();
+      };
+      // typeof window === 'undefined' takes the fallback branch alone (no IO + no
+      // window), so the requestIdleCallback lookup must be gated separately —
+      // dereferencing `window` here without that guard would ReferenceError in
+      // pure Node/SSR. Greptile #4001/P1.
+      const ric = typeof window !== 'undefined'
+        ? (window as unknown as { requestIdleCallback?: (cb: () => void) => number }).requestIdleCallback
+        : undefined;
+      if (typeof ric === 'function') ric(tick);
+      else setTimeout(tick, 0);
+      return;
+    }
+    this.viewportObserverRegistered = true;
+    this.viewportObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) {
+          this.unobserveViewport();
+          callback();
+          return;
+        }
+      }
+    }, { rootMargin: `${marginPx}px` });
+    this.viewportObserver.observe(this.element);
+  }
+
+  private unobserveViewport(): void {
+    if (this.viewportObserver) {
+      this.viewportObserver.disconnect();
+      this.viewportObserver = null;
+    }
+  }
+
+  public isNearViewport(marginPx = 400): boolean {
+    if (!this.element.isConnected) return false;
+    if (typeof window === 'undefined') return true;
+
+    const style = window.getComputedStyle(this.element);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+
+    const rect = this.element.getBoundingClientRect();
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+
+    if (rect.width === 0 || rect.height === 0) return false;
+
+    return (
+      rect.bottom >= -marginPx &&
+      rect.right >= -marginPx &&
+      rect.top <= viewportHeight + marginPx &&
+      rect.left <= viewportWidth + marginPx
+    );
+  }
+
   public showLoading(message = t('common.loading')): void {
     if (this._locked) return;
+    this.setErrorState(false);
     this.clearRetryCountdown();
-    replaceChildren(this.content,
+    this.replaceContent(
       h('div', { className: 'panel-loading' },
         h('div', { className: 'panel-loading-radar' },
           h('div', { className: 'panel-radar-sweep' }),
@@ -666,7 +906,7 @@ export class Panel {
     const children: (HTMLElement | string)[] = [radarEl, msgEl];
 
     if (this.retryCallback) {
-      const backoffSeconds = autoRetrySeconds ?? Math.min(15 * Math.pow(2, this.retryAttempt), 180);
+      const backoffSeconds = autoRetrySeconds ?? Math.min(15 * 2 ** this.retryAttempt, 180);
       this.retryAttempt++;
       let remaining = Math.round(backoffSeconds);
       const countdownEl = h('div', { className: 'panel-error-countdown' },
@@ -683,40 +923,222 @@ export class Panel {
         countdownEl.textContent = `${t('common.retrying')} (${remaining}s)`;
       }, 1000);
     }
-    replaceChildren(this.content, h('div', { className: 'panel-error-state' }, ...children));
+    this.replaceContent(h('div', { className: 'panel-error-state' }, ...children));
   }
 
   public resetRetryBackoff(): void {
     this.retryAttempt = 0;
   }
 
-  public showLocked(_features: string[] = []): void {
+  /**
+   * Drop the error badge, the pending auto-retry countdown, and the backoff.
+   * The single owner of "this panel has recovered": `setContentHtml`,
+   * `setContentNodes` and `setTrustedContent` all clear through here, so the
+   * three pieces of state can never be cleared apart. Without it, a showError()
+   * countdown scheduled before a successful load keeps ticking and fires one
+   * redundant refresh after the panel has already recovered.
+   *
+   * Public because a panel may recover without replacing its content (an
+   * in-place row patch); a panel that DOES replace content should use the
+   * `setContent*` helpers instead, which clear as part of the write.
+   */
+  public clearErrorState(): void {
+    this.setErrorState(false);
+    this.clearRetryCountdown();
+    this.retryAttempt = 0;
+  }
+
+  public showLocked(features: string[] = []): void {
     this._locked = true;
     this.clearRetryCountdown();
+    this._snapshotContentForRestore();
 
     for (let child = this.header.nextElementSibling; child && child !== this.content; child = child.nextElementSibling) {
       (child as HTMLElement).style.display = 'none';
     }
     this.element.classList.add('panel-is-locked');
 
-    const lockSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>`;
     const iconEl = h('div', { className: 'panel-locked-icon' });
-    iconEl.innerHTML = lockSvg;
+    setTrustedHtml(iconEl, trustedHtml(lockSvg, 'legacy direct innerHTML migration'));
 
     const lockedChildren: (HTMLElement | string)[] = [
       iconEl,
       h('div', { className: 'panel-locked-desc' }, t('premium.lockedDesc')),
     ];
 
-    const ctaBtn = h('button', { type: 'button', className: 'panel-locked-cta' }, t('premium.joinWaitlist'));
+    if (features.length > 0) {
+      const featureList = h('ul', { className: 'panel-locked-features' });
+      for (const feat of features) {
+        featureList.appendChild(h('li', {}, feat));
+      }
+      lockedChildren.push(featureList);
+    }
+
+    const ctaBtn = h('button', { type: 'button', className: 'panel-locked-cta' }, 'Upgrade to Pro');
     if (isDesktopRuntime()) {
-      ctaBtn.addEventListener('click', () => void invokeTauri<void>('open_settings_window_command').catch(() => {}));
+      ctaBtn.addEventListener('click', () => {
+        void openExternalUrl('https://worldmonitor.app/pro');
+      });
     } else {
-      ctaBtn.addEventListener('click', () => window.open('https://worldmonitor.app/pro', '_blank'));
+      ctaBtn.addEventListener('click', () => {
+        import('@/services/checkout').then(m => import('@/config/products').then(p => m.startCheckout(p.DEFAULT_UPGRADE_PRODUCT))).catch(() => {
+          window.open('https://worldmonitor.app/pro', '_blank', 'noopener,noreferrer');
+        });
+      });
     }
     lockedChildren.push(ctaBtn);
 
-    replaceChildren(this.content, h('div', { className: 'panel-locked-state' }, ...lockedChildren));
+    this.replaceContent(h('div', { className: 'panel-locked-state' }, ...lockedChildren));
+  }
+
+  /**
+   * CTA copy per gate reason, resolved lazily so each call translates only
+   * the two strings it renders. #4771 billing-aware states: the user has
+   * (or had) paid evidence, so the CTA must never read as a fresh upsell
+   * (duplicate-checkout risk). Their keys live under components.billingState
+   * (NOT premium.*): premium. is a first-paint shell namespace and these
+   * CTAs only render after the Convex entitlement round-trip, well past
+   * full-locale load.
+   */
+  private static gatedCtaEntry(
+    reason: PanelGateReason,
+  ): { icon: string; desc: string; cta: string } | null {
+    switch (reason) {
+      case PanelGateReason.ANONYMOUS:
+        return {
+          icon: lockSvg,
+          desc: t('premium.signInToUnlock'),
+          cta: t('premium.signIn'),
+        };
+      case PanelGateReason.FREE_TIER:
+        return {
+          icon: upgradeSvg,
+          desc: t('premium.upgradeDesc'),
+          cta: t('premium.upgradeToPro'),
+        };
+      case PanelGateReason.PAYMENT_ON_HOLD:
+        return {
+          icon: lockSvg,
+          desc: t('components.billingState.onHoldDesc'),
+          cta: t('components.billingState.updatePayment'),
+        };
+      case PanelGateReason.RENEWAL_PENDING:
+        return {
+          icon: lockSvg,
+          desc: t('components.billingState.renewalPendingDesc'),
+          cta: t('components.billingState.refreshStatus'),
+        };
+      case PanelGateReason.RENEWAL_FAILED:
+        return {
+          icon: lockSvg,
+          desc: t('components.billingState.renewalFailedDesc'),
+          cta: t('components.billingState.manageBilling'),
+        };
+      case PanelGateReason.LAPSED:
+        return {
+          icon: upgradeSvg,
+          desc: t('components.billingState.lapsedDesc'),
+          cta: t('components.billingState.resubscribe'),
+        };
+      default:
+        return null;
+    }
+  }
+
+  public showGatedCta(reason: PanelGateReason, onAction: () => void): void {
+    const entry = Panel.gatedCtaEntry(reason);
+    if (!entry) return; // PanelGateReason.NONE should never reach here
+
+    // Same verdict already rendered — skip the DOM teardown/rebuild.
+    // Gating re-runs on every subscription-row change (#4771), including
+    // Convex updates to fields irrelevant to the gate verdict.
+    if (this._locked && this._lastGateReason === reason) return;
+    this._lastGateReason = reason;
+
+    // Bail-out done — now commit to the locked state. Doing this AFTER the
+    // guard avoids a half-locked DOM (header siblings hidden, panel-is-locked
+    // class set, _savedContent populated) on the acknowledged-impossible
+    // NONE-reason path. PR #3814 review (Greptile P2).
+    this._locked = true;
+    this.clearRetryCountdown();
+    this._snapshotContentForRestore();
+
+    // Hide elements between header and content (same as showLocked)
+    for (let child = this.header.nextElementSibling; child && child !== this.content; child = child.nextElementSibling) {
+      (child as HTMLElement).style.display = 'none';
+    }
+    this.element.classList.add('panel-is-locked');
+
+    const iconEl = h('div', { className: 'panel-locked-icon' });
+    setTrustedHtml(iconEl, trustedHtml(entry.icon, 'legacy direct innerHTML migration'));
+
+    const descEl = h('div', { className: 'panel-locked-desc' }, entry.desc);
+
+    const ctaBtn = h('button', { type: 'button', className: 'panel-locked-cta' }, entry.cta);
+    ctaBtn.addEventListener('click', onAction);
+
+    this.replaceContent(h('div', { className: 'panel-locked-state' }, iconEl, descEl, ctaBtn));
+  }
+
+  public unlockPanel(): void {
+    if (!this._locked) return;
+    this._locked = false;
+    this._lastGateReason = null;
+    this.element.classList.remove('panel-is-locked');
+    // Re-show hidden elements
+    for (let child = this.header.nextElementSibling; child && child !== this.content; child = child.nextElementSibling) {
+      (child as HTMLElement).style.display = '';
+    }
+    // Restore the pre-lock content if we have it. The saved nodes are the
+    // ORIGINAL DOM nodes the subclass built — reattaching preserves event
+    // listeners and any references the subclass holds (this.inputEl etc.),
+    // and fixes constructor-only subclasses (DeductionPanel,
+    // ChatAnalystPanel, …) that would otherwise end up with an empty body.
+    // Fall back to the legacy empty-content behaviour if nothing was saved.
+    if (this._savedContent !== null) {
+      this.replaceContent(...this._savedContent);
+      this._savedContent = null;
+    } else {
+      this.replaceContent();
+    }
+  }
+
+  /**
+   * Remove sensitive panel payloads from both the visible DOM and the
+   * pre-lock restoration snapshot. Pro panels call this on sign-out or
+   * downgrade so unlockPanel() cannot resurrect data captured before the
+   * entitlement changed.
+   */
+  protected clearSensitiveContent(): void {
+    this._savedContent = null;
+    this.cancelPendingContentWrite();
+    if (!this._locked) this.replaceContent();
+  }
+
+  /**
+   * Drop a debounced `setContentHtml` write that has not committed yet.
+   *
+   * Any write that lands the content immediately must call this first: the
+   * queued string commits `contentDebounceMs` later regardless, so without it a
+   * `setSafeContent(old)` still in flight overwrites the render that just
+   * replaced it — 150ms after the panel already looked correct.
+   */
+  private cancelPendingContentWrite(): void {
+    this.pendingContentHtml = null;
+    this.pendingContentCallback = null;
+    if (this.contentDebounceTimer) {
+      clearTimeout(this.contentDebounceTimer);
+      this.contentDebounceTimer = null;
+    }
+  }
+
+  // Capture this.content's current child nodes so unlockPanel can put them
+  // back. Only snapshots on the FIRST transition into a lock state — a
+  // re-entrant showLocked / showGatedCta must not overwrite the cache with
+  // the locked-state CTA. The cache is cleared by unlockPanel on restore.
+  private _snapshotContentForRestore(): void {
+    if (this._savedContent !== null) return;
+    this._savedContent = Array.from(this.content.childNodes);
   }
 
   public showRetrying(message?: string, countdownSeconds?: number): void {
@@ -749,7 +1171,7 @@ export class Panel {
       }, 1000);
     }
 
-    replaceChildren(this.content,
+    this.replaceContent(
       h('div', { className: 'panel-error-state' }, ...children),
     );
   }
@@ -786,7 +1208,7 @@ export class Panel {
         }, t('components.panel.openSettings')),
       );
     }
-    replaceChildren(this.content, msgEl);
+    this.replaceContent(msgEl);
   }
 
   public setCount(count: number): void {
@@ -810,15 +1232,102 @@ export class Panel {
     }
   }
 
-  public setContent(html: string): void {
+  /**
+   * The raw content primitive. It deliberately does NOT touch the error state:
+   * `showError` / `showRetrying` set the badge and then paint through here, so
+   * a clear inside this method would erase the state its own callers just set.
+   *
+   * Every such write invalidates `lastCommittedHtml`, so routing them through
+   * here makes that invariant structural instead of something each new call site
+   * has to remember. Do not call `replaceChildren(this.content, …)` directly —
+   * for a SUCCESSFUL render use `setContentNodes` / `setTrustedContent`, which
+   * add the error-state clear this method must not do.
+   */
+  private replaceContent(...children: DomChild[]): void {
+    // Structural, for the same reason `invalidateCommittedHtml` is: EVERY
+    // immediate write must drop a queued one, and `showError` / `showRetrying` /
+    // `showLoading` / `showLocked` / `showGatedCta` / `showConfigError` /
+    // `unlockPanel` all land content through here. Without it a `setSafeContent`
+    // queued moments earlier commits `contentDebounceMs` later and paints over
+    // the render that just replaced it — under a chip nothing then clears, which
+    // is #6557 reached from the other direction.
+    //
+    // This does not self-cancel the debounce: `setContentImmediate` writes via
+    // `setTrustedHtml` and never routes through here.
+    this.cancelPendingContentWrite();
+    replaceChildren(this.content, ...children);
+    this.invalidateCommittedHtml();
+  }
+
+  /**
+   * The content dirty-check is only sound while EVERY writer invalidates it, so
+   * it lives in one method rather than being repeated at each write path.
+   */
+  private invalidateCommittedHtml(): void {
+    this.lastCommittedHtml = null;
+  }
+
+  /**
+   * Commit a render as the panel's authoritative content — the `setSafeContent`
+   * of the DOM-node path, and a true twin of it: same lock bail, same
+   * error-state clear.
+   *
+   * `setContentHtml` drops the error badge, the pending auto-retry countdown and
+   * the backoff on every such write. A panel that calls
+   * `replaceChildren(this.content, …)` itself skips all three, so one transient
+   * `showError()` latches the red `Error` chip over correct data for the rest of
+   * the session and leaves a countdown ticking toward a redundant refresh
+   * (#6557: `cii` and `strategic-risk` in production).
+   *
+   * "Authoritative content" covers a settled empty/unavailable state as well as
+   * a recovery — both mean "this, not an error state". It does NOT cover a
+   * loading render: `showLoading` deliberately leaves `retryAttempt` alone, and
+   * resetting the backoff on every loading paint would flatten it to its floor.
+   */
+  protected setContentNodes(...children: DomChild[]): void {
     if (this._locked) return;
-    this.clearRetryCountdown();
-    this.retryAttempt = 0;
-    if (this.pendingContentHtml === html || this.content.innerHTML === html) {
+    this.clearErrorState();
+    this.cancelPendingContentWrite();
+    this.replaceContent(...children);
+  }
+
+  /**
+   * Trusted-HTML twin of `setContentNodes`, for panels that build their own
+   * markup string and cannot go through the debounced `setSafeContent` path.
+   */
+  protected setTrustedContent(html: TrustedHtml): void {
+    if (this._locked) return;
+    this.clearErrorState();
+    this.cancelPendingContentWrite();
+    setTrustedHtml(this.content, html);
+    this.invalidateCommittedHtml();
+  }
+
+  public setSafeContent(html: SafeHtml, afterUpdate?: () => void): void {
+    this.setContentHtml(safeHtmlToString(html), afterUpdate);
+  }
+
+  private setContentHtml(html: string, afterUpdate?: () => void): void {
+    if (this._locked) return;
+    this.clearErrorState();
+    if (this.pendingContentHtml === html) {
+      if (afterUpdate) this.pendingContentCallback = afterUpdate;
+      return;
+    }
+    if (this.lastCommittedHtml === html) {
+      // The DOM already shows `html`, but a DIFFERENT write may still be queued
+      // behind the debounce — and returning without cancelling it lets that
+      // stale write land afterwards, permanently. World Clock reproduces it:
+      // open settings, then close within the debounce window, and the settings
+      // markup commits after the clock has been asked to come back (which also
+      // strands the cached row handles, so the clock stops ticking).
+      this.cancelPendingContentWrite();
+      afterUpdate?.();
       return;
     }
 
     this.pendingContentHtml = html;
+    this.pendingContentCallback = afterUpdate ?? null;
     if (this.contentDebounceTimer) {
       clearTimeout(this.contentDebounceTimer);
     }
@@ -831,15 +1340,28 @@ export class Panel {
   }
 
   private setContentImmediate(html: string): void {
+    // The lock is re-checked HERE, not only at schedule time in `setContentHtml`.
+    // A panel locked during the debounce window (showGatedCta / showLocked fire
+    // from the async entitlement pass) would otherwise have this timer paint the
+    // premium payload over the upgrade CTA, and no later writer repaints it
+    // because every other write path bails on `_locked`.
+    if (this._locked) {
+      this.cancelPendingContentWrite();
+      return;
+    }
     if (this.contentDebounceTimer) {
       clearTimeout(this.contentDebounceTimer);
       this.contentDebounceTimer = null;
     }
 
     this.pendingContentHtml = null;
-    if (this.content.innerHTML !== html) {
-      this.content.innerHTML = html;
+    const afterUpdate = this.pendingContentCallback;
+    this.pendingContentCallback = null;
+    if (this.lastCommittedHtml !== html) {
+      setTrustedHtml(this.content, trustedHtml(html, 'legacy direct innerHTML migration'));
+      this.lastCommittedHtml = html;
     }
+    afterUpdate?.();
   }
 
   public show(): void {
@@ -889,6 +1411,20 @@ export class Panel {
   }
 
   /**
+   * Set the panel's severity level, controlling the header pulse dot speed.
+   * critical = 0.6s, high = 1s, medium = 1.8s, low = 2.5s, none = hidden.
+   */
+  public setSeverity(level: PanelSeverity): void {
+    if (level === this.currentSeverity) return;
+    this.currentSeverity = level;
+    if (!this.severityDotEl) return;
+    this.severityDotEl.className = 'panel-severity-dot';
+    if (level !== 'none') {
+      this.severityDotEl.classList.add(`severity-${level}`);
+    }
+  }
+
+  /**
    * Get the panel ID
    */
   public getId(): string {
@@ -900,9 +1436,7 @@ export class Panel {
    */
   public resetHeight(): void {
     this.element.classList.remove('resized', 'span-1', 'span-2', 'span-3', 'span-4');
-    const spans = loadPanelSpans();
-    delete spans[this.panelId];
-    localStorage.setItem(PANEL_SPANS_KEY, JSON.stringify(spans));
+    clearPanelSpan(this.panelId);
   }
 
   public resetWidth(): void {
@@ -919,8 +1453,23 @@ export class Panel {
   }
 
   public destroy(): void {
+    this.destroyed = true;
     this.abortController.abort();
     this.clearRetryCountdown();
+    this.unobserveViewport();
+    if (this.connectedFallbackTimer !== null) {
+      clearTimeout(this.connectedFallbackTimer);
+      this.connectedFallbackTimer = null;
+    }
+    this.connectedCallbacks = [];
+    if (this.freshnessUnsubscribe) {
+      this.freshnessUnsubscribe();
+      this.freshnessUnsubscribe = null;
+    }
+    if (this.freshnessRefreshTimer) {
+      clearInterval(this.freshnessRefreshTimer);
+      this.freshnessRefreshTimer = null;
+    }
     if (this.colSpanReconcileRaf !== null) {
       cancelAnimationFrame(this.colSpanReconcileRaf);
       this.colSpanReconcileRaf = null;
@@ -930,6 +1479,11 @@ export class Panel {
       this.contentDebounceTimer = null;
     }
     this.pendingContentHtml = null;
+    this.pendingContentCallback = null;
+    // Drop the snapshot of pre-lock children so a panel destroyed while
+    // still in the locked state doesn't retain the detached DOM subtree
+    // for the lifetime of the Panel instance. PR #3814 review (Greptile P2).
+    this._savedContent = null;
 
     if (this.tooltipCloseHandler) {
       document.removeEventListener('click', this.tooltipCloseHandler);

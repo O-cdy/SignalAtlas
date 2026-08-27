@@ -568,6 +568,9 @@
       "status": "terms-review",
       "references": [
         {
+          "path": "api/cron/signalatlas-seed.ts"
+        },
+        {
           "path": "scripts/_kv-storage.mjs"
         },
         {
@@ -3141,7 +3144,7 @@
     {
       "host": "earthobservatory.nasa.gov",
       "provider": "earthobservatory.nasa.gov",
-      "kind": "structured",
+      "kind": "feed+structured",
       "observed": true,
       "license": "Provider terms for this upstream API/dataset; verify before redistribution",
       "attribution": "Credit earthobservatory.nasa.gov and link to the original upstream API/dataset.",
@@ -3149,6 +3152,12 @@
       "references": [
         {
           "path": "scripts/seed-climate-news.mjs"
+        },
+        {
+          "path": "server/worldmonitor/news/v1/_feeds.ts"
+        },
+        {
+          "path": "src/config/feeds.ts"
         }
       ]
     },
@@ -3161,6 +3170,9 @@
       "attribution": "Credit earthquake.usgs.gov and link to the original upstream API/dataset.",
       "status": "terms-review",
       "references": [
+        {
+          "path": "api/cron/signalatlas-seed.ts"
+        },
         {
           "path": "scripts/seed-earthquakes.mjs"
         }
@@ -3497,6 +3509,9 @@
       "attribution": "Credit eonet.gsfc.nasa.gov and link to the original upstream API/dataset.",
       "status": "terms-review",
       "references": [
+        {
+          "path": "api/cron/signalatlas-seed.ts"
+        },
         {
           "path": "scripts/seed-natural-events.mjs"
         }
@@ -7292,7 +7307,7 @@
     {
       "host": "reliefweb.int",
       "provider": "reliefweb.int",
-      "kind": "structured",
+      "kind": "feed+structured",
       "observed": true,
       "license": "Provider terms for this upstream API/dataset; verify before redistribution",
       "attribution": "Credit reliefweb.int and link to the original upstream API/dataset.",
@@ -7300,6 +7315,12 @@
       "references": [
         {
           "path": "scripts/seed-climate-news.mjs"
+        },
+        {
+          "path": "server/worldmonitor/news/v1/_feeds.ts"
+        },
+        {
+          "path": "src/config/feeds.ts"
         }
       ]
     },
@@ -7906,6 +7927,20 @@
         },
         {
           "path": "src/config/variants/tech.ts"
+        }
+      ]
+    },
+    {
+      "host": "signalatlas.worldmonitor.app",
+      "provider": "signalatlas.worldmonitor.app",
+      "kind": "structured",
+      "observed": true,
+      "license": "Excluded: first-party, control-plane, UI, or rendering transport",
+      "attribution": "Excluded from the external-provider count: not an ingested upstream dataset.",
+      "status": "excluded",
+      "references": [
+        {
+          "path": "src/config/variant-meta.ts"
         }
       ]
     },
@@ -11236,14 +11271,23 @@
     {
       "host": "www.gdacs.org",
       "provider": "www.gdacs.org",
-      "kind": "structured",
+      "kind": "feed+structured",
       "observed": true,
       "license": "Provider terms for this upstream API/dataset; verify before redistribution",
       "attribution": "Credit www.gdacs.org and link to the original upstream API/dataset.",
       "status": "terms-review",
       "references": [
         {
+          "path": "api/cron/signalatlas-seed.ts"
+        },
+        {
           "path": "scripts/seed-natural-events.mjs"
+        },
+        {
+          "path": "server/worldmonitor/news/v1/_feeds.ts"
+        },
+        {
+          "path": "src/config/feeds.ts"
         }
       ]
     },
@@ -13406,6 +13450,20 @@
       "references": [
         {
           "path": "scripts/seed-climate-news.mjs"
+        }
+      ]
+    },
+    {
+      "host": "www.unhcr.org",
+      "provider": "www.unhcr.org",
+      "kind": "feed",
+      "observed": true,
+      "license": "Provider terms for this feed publisher; verify before redistribution",
+      "attribution": "Credit www.unhcr.org and link to the original feed publisher.",
+      "status": "terms-review",
+      "references": [
+        {
+          "path": "server/worldmonitor/news/v1/_feeds.ts"
         }
       ]
     },

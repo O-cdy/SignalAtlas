@@ -10,7 +10,7 @@ The inventory is **generated, not hand-written**: `scripts/source-attribution.mj
 ## Observed Source Inventory
 
 {/* BEGIN GENERATED SOURCE ATTRIBUTION */}
-This generated inventory covers **735 active source hosts** representing **730 active providers** (**310 structured/API**, **458 feed**, and **30 operational-status** hosts). It is derived from source declarations in `scripts/`, `server/`, `api/`, and `src/`. Each row shows the configured provider identity and where the source is referenced.
+This generated inventory covers **736 active source hosts** representing **731 active providers** (**310 structured/API**, **462 feed**, and **30 operational-status** hosts). It is derived from source declarations in `scripts/`, `server/`, `api/`, and `src/`. Each row shows the configured provider identity and where the source is referenced.
 
 | Provider | Observed surface |
 | --- | --- |
@@ -48,7 +48,7 @@ This generated inventory covers **735 active source hosts** representing **730 a
 | api.abuseipdb.com (api.abuseipdb.com) | structured — scripts/ais-relay.cjs, scripts/seed-cyber-threats.mjs, server/worldmonitor/cyber/v1/_shared.ts |
 | api.aviationstack.com (api.aviationstack.com) | structured — scripts/ais-relay.cjs, scripts/seed-aviation.mjs, server/worldmonitor/aviation/v1/_shared.ts |
 | api.axios.com (api.axios.com) | feed — server/worldmonitor/news/v1/_feeds.ts, src/config/feeds.ts |
-| api.cloudflare.com (api.cloudflare.com) | structured — scripts/_kv-storage.mjs, scripts/_r2-storage.mjs, scripts/seed-internet-outages.mjs, scripts/seed-military-bases.mjs |
+| api.cloudflare.com (api.cloudflare.com) | structured — api/cron/signalatlas-seed.ts, scripts/_kv-storage.mjs, scripts/_r2-storage.mjs, scripts/seed-internet-outages.mjs, +1 more |
 | api.coingecko.com (api.coingecko.com) | structured — scripts/ais-relay.cjs |
 | api.data.gov.my (api.data.gov.my) | structured — scripts/backfill-fuel-prices-prev.mjs, scripts/seed-fuel-prices.mjs |
 | api.datos.gob.mx (api.datos.gob.mx) | structured — scripts/backfill-fuel-prices-prev.mjs |
@@ -198,8 +198,8 @@ This generated inventory covers **735 active source hosts** representing **730 a
 | dwamdstream103.akamaized.net (dwamdstream103.akamaized.net) | feed — src/components/LiveNewsPanel.ts |
 | dwamdstream104.akamaized.net (dwamdstream104.akamaized.net) | feed — src/components/LiveNewsPanel.ts |
 | e00-elmundo.uecdn.es (e00-elmundo.uecdn.es) | feed — src/config/feeds.ts |
-| earthobservatory.nasa.gov (earthobservatory.nasa.gov) | structured — scripts/seed-climate-news.mjs |
-| earthquake.usgs.gov (earthquake.usgs.gov) | structured — scripts/seed-earthquakes.mjs |
+| earthobservatory.nasa.gov (earthobservatory.nasa.gov) | feed+structured — scripts/seed-climate-news.mjs, server/worldmonitor/news/v1/_feeds.ts, src/config/feeds.ts |
+| earthquake.usgs.gov (earthquake.usgs.gov) | structured — api/cron/signalatlas-seed.ts, scripts/seed-earthquakes.mjs |
 | Earthquakes Canada (NRCan) (www.earthquakescanada.nrcan.gc.ca) | structured — scripts/seismology/nrcan-atom.mjs |
 | ec.europa.eu (ec.europa.eu) | feed+structured — scripts/_eurostat-utils.mjs, scripts/seed-economic-calendar.mjs, scripts/seed-eurostat-country-data.mjs, scripts/seed-resilience-static.mjs, +1 more |
 | ecfr.eu (ecfr.eu) | feed — src/config/feeds.ts |
@@ -223,7 +223,7 @@ This generated inventory covers **735 active source hosts** representing **730 a
 | english.nv.ua (english.nv.ua) | feed — server/worldmonitor/news/v1/_feeds.ts, src/config/feeds.ts |
 | ENTSO-E Transparency Platform (web-api.tp.entsoe.eu) | structured — scripts/seed-electricity-prices.mjs |
 | Environment and Climate Change Canada (ECCC) (api.weather.gc.ca) | structured — scripts/_weather-alert-select.mjs |
-| eonet.gsfc.nasa.gov (eonet.gsfc.nasa.gov) | structured — scripts/seed-natural-events.mjs |
+| eonet.gsfc.nasa.gov (eonet.gsfc.nasa.gov) | structured — api/cron/signalatlas-seed.ts, scripts/seed-natural-events.mjs |
 | EPA RadNet (radnet.epa.gov) | structured — scripts/seed-radiation-watch.mjs |
 | ertflix.ascdn.broadpeak.io (ertflix.ascdn.broadpeak.io) | feed — src/components/LiveNewsPanel.ts |
 | es.euronews.com (es.euronews.com) | feed — src/config/feeds.ts |
@@ -471,7 +471,7 @@ This generated inventory covers **735 active source hosts** representing **730 a
 | reasonstobecheerful.world (reasonstobecheerful.world) | feed — server/worldmonitor/news/v1/_feeds.ts, src/config/feeds.ts |
 | reddit.com (reddit.com) | structured — scripts/ais-relay.cjs, src/services/story-share.ts |
 | ReliefWeb (UN OCHA) (api.reliefweb.int) | structured — scripts/seed-climate-disasters.mjs |
-| reliefweb.int (reliefweb.int) | structured — scripts/seed-climate-news.mjs |
+| reliefweb.int (reliefweb.int) | feed+structured — scripts/seed-climate-news.mjs, server/worldmonitor/news/v1/_feeds.ts, src/config/feeds.ts |
 | renaissancecapital.com (renaissancecapital.com) | feed — src/config/feeds.ts |
 | Reporters Without Borders (RSF) (rsf.org) | structured — scripts/seed-resilience-static.mjs |
 | Resend email service (api.resend.com) | structured — server/worldmonitor/leads/v1/register-interest.ts, server/worldmonitor/leads/v1/submit-contact.ts |
@@ -516,6 +516,7 @@ This generated inventory covers **735 active source hosts** representing **730 a
 | services7.arcgis.com (services7.arcgis.com) | structured — scripts/fetch-mirta-bases.mjs |
 | services9.arcgis.com (services9.arcgis.com) | structured — scripts/build-chokepoint-transit-snapshot.mjs, scripts/seed-portwatch-chokepoints-ref.mjs, scripts/seed-portwatch-disruptions.mjs, scripts/seed-portwatch-port-activity.mjs, +1 more |
 | sifted.eu (sifted.eu) | feed+structured — server/worldmonitor/news/v1/_feeds.ts, src/config/feeds.ts, src/config/variants/tech.ts |
+| signalatlas.worldmonitor.app (signalatlas.worldmonitor.app) | structured — src/config/variant-meta.ts |
 | simpleflying.com (simpleflying.com) | structured — scripts/seed-aviation.mjs, server/worldmonitor/aviation/v1/list-aviation-news.ts |
 | singularityhub.com (singularityhub.com) | feed — server/worldmonitor/news/v1/_feeds.ts, src/config/feeds.ts |
 | SIPRI Arms Transfers Database (atbackend.sipri.org) | structured — scripts/_defense-industrial-source.mjs |
@@ -723,7 +724,7 @@ This generated inventory covers **735 active source hosts** representing **730 a
 | www.ft.com (www.ft.com) | feed — server/worldmonitor/news/v1/_feeds.ts, src/config/feeds.ts |
 | www.fwdstart.me (www.fwdstart.me) | structured — api/fwdstart.js |
 | www.g4media.ro (www.g4media.ro) | feed — server/worldmonitor/news/v1/_feeds.ts, src/config/feeds.ts |
-| www.gdacs.org (www.gdacs.org) | structured — scripts/seed-natural-events.mjs |
+| www.gdacs.org (www.gdacs.org) | feed+structured — api/cron/signalatlas-seed.ts, scripts/seed-natural-events.mjs, server/worldmonitor/news/v1/_feeds.ts, src/config/feeds.ts |
 | www.gets.govt.nz (www.gets.govt.nz) | structured — scripts/seed-global-tenders.mjs |
 | www.gitex.com (www.gitex.com) | structured — scripts/ais-relay.cjs, scripts/seed-research.mjs, server/worldmonitor/research/v1/list-tech-events.ts |
 | www.githubstatus.com (www.githubstatus.com) | operational-status — server/worldmonitor/infrastructure/v1/list-service-statuses.ts |
@@ -842,6 +843,7 @@ This generated inventory covers **735 active source hosts** representing **730 a
 | www.tvanouvelles.ca (www.tvanouvelles.ca) | feed — server/worldmonitor/news/v1/_feeds.ts, src/config/feeds.ts |
 | www.twz.com (www.twz.com) | feed — server/worldmonitor/news/v1/_feeds.ts, src/config/feeds.ts |
 | www.unep.org (www.unep.org) | structured — scripts/seed-climate-news.mjs |
+| www.unhcr.org (www.unhcr.org) | feed — server/worldmonitor/news/v1/_feeds.ts |
 | www.upworthy.com (www.upworthy.com) | feed — src/config/feeds.ts |
 | www.vanguardngr.com (www.vanguardngr.com) | feed — server/worldmonitor/news/v1/_feeds.ts, src/config/feeds.ts |
 | www.vercel-status.com (www.vercel-status.com) | operational-status — server/worldmonitor/infrastructure/v1/list-service-statuses.ts |

@@ -17,3 +17,4 @@
 - Default scope: earthquakes, natural disasters, wildfires, internet disruptions, disaster news, outage news, and AI summary/analysis.
 - Deployment target: Vercel + Upstash Redis with 15-minute Vercel Cron seeding and no-key degradation states.
 - Deployment trigger refreshed at `2026-08-27T08:40:00Z` after the GitHub repository was made public.
+- Deployment trigger refreshed at `2026-08-27T08:51:20Z` after reconnecting the Vercel GitHub integration.

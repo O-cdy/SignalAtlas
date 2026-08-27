@@ -24,3 +24,39 @@ target/
 # node:test suite (production env + Sentry) on every request (WORLDMONITOR-VD).
 # Guarded by tests/deploy-config.test.mjs.
 api/**/*.test.mjs
+
+# SignalAtlas Hobby deployment: Vercel Hobby allows at most 12 Serverless
+# Functions per deployment. The upstream World Monitor repo contains a much
+# larger public API fleet, so this fork only deploys the endpoints needed by the
+# SignalAtlas disaster/outage dashboard and its seed cron.
+api/**
+!api/
+!api/_*.js
+!api/_*.ts
+!api/_*.d.ts
+!api/bootstrap.js
+!api/health.js
+!api/version.js
+!api/rss-proxy.js
+!api/cron/
+!api/cron/signalatlas-seed.ts
+!api/news/
+!api/news/v1/
+!api/news/v1/[rpc].ts
+!api/seismology/
+!api/seismology/v1/
+!api/seismology/v1/[rpc].ts
+!api/natural/
+!api/natural/v1/
+!api/natural/v1/[rpc].ts
+!api/wildfire/
+!api/wildfire/v1/
+!api/wildfire/v1/[rpc].ts
+!api/infrastructure/
+!api/infrastructure/v1/
+!api/infrastructure/v1/[rpc].ts
+!api/climate/
+!api/climate/v1/
+!api/climate/v1/[rpc].ts
+!api/security/
+!api/security/report.js

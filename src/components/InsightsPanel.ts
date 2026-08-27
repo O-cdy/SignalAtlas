@@ -447,6 +447,7 @@ export class InsightsPanel extends Panel {
         // Tech variant: no geopolitical context, just tech news summarization
         // Commodity variant: commodities-specific framing for gold/metals/energy markets
         // Energy variant: energy-specific framing — pipelines, chokepoints, shortages, disruptions
+        // SignalAtlas variant: disaster/outage framing while still following enabled modules.
         const theaterContext = SITE_VARIANT === 'full' ? this.getTheaterPostureContext() : '';
         let geoContext = SITE_VARIANT === 'full'
           ? (focalSummary.aiContext || signalSummary.aiContext) + theaterContext
@@ -454,7 +455,9 @@ export class InsightsPanel extends Panel {
             ? 'You are generating a commodities market brief. Focus on gold and precious metals price movements, mining supply risks, energy market dynamics, and macro factors driving commodity prices. Highlight supply disruptions, geopolitical risks to mining regions, central bank gold activity, and USD/inflation trends.'
             : SITE_VARIANT === 'energy'
               ? 'You are generating a global energy-intelligence brief. Focus on physical supply: oil & gas pipeline status and disruptions (Druzhba, Nord Stream, TurkStream, Power of Siberia, CPC), chokepoint flow (Hormuz, Malacca, Suez, Bab el-Mandeb, Turkish Straits, Danish Straits, Panama), storage levels (EU gas, US SPR, IEA stocks, days-of-cover), fuel shortages (jet / petrol / diesel / heating oil), refinery outages, LNG flows, OPEC+ production signals, and sanctions impacts. Prefer physical constraints and evidence-grounded status changes over price commentary. Attribute every flow figure to its source (AIS calibration, operator disclosure, regulator data) — never ship a bare conclusion.'
-              : '';
+              : SITE_VARIANT === 'signalatlas'
+                ? 'You are generating a SignalAtlas disaster-and-outage brief. Focus on earthquakes, severe weather, floods, storms, wildfires, disease outbreaks, internet disruptions, electric-grid outages, infrastructure failures, humanitarian impacts, and cascading risks. Prioritize actionable situational awareness: where the event is, what changed recently, who is affected, what services or regions are disrupted, and what remains uncertain. Use only disaster, hazard, outage, advisory, and enabled-module context by default; if additional modules are enabled in this variant later, expand the analysis to those active modules without reintroducing hidden domains.'
+                : '';
         const insightsFw = getActiveFrameworkForPanel('insights');
         if (insightsFw) {
           geoContext = `${geoContext}\n\n---\nAnalytical Framework:\n${insightsFw.systemPromptAppend}`;
@@ -686,6 +689,7 @@ export class InsightsPanel extends Panel {
       SITE_VARIANT === 'tech'      ? `🚀 ${t('components.insights.briefTech')}`
     : SITE_VARIANT === 'commodity' ? `⛏️ ${t('components.insights.briefCommodity')}`
     : SITE_VARIANT === 'energy'    ? `⚡ ${t('components.insights.briefEnergy')}`
+    : SITE_VARIANT === 'signalatlas' ? `🌐 SignalAtlas Brief`
     :                                `🌍 ${t('components.insights.briefWorld')}`;
     return `
       <div class="insights-brief">

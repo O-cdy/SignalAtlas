@@ -2,6 +2,7 @@ import i18next from 'i18next';
 import LanguageDetector from 'i18next-browser-languagedetector';
 
 import { enqueueSentryCall } from '@/bootstrap/sentry-defer';
+import { SITE_VARIANT } from '@/config/variant';
 import { resolveLanguageTag } from '@/shared/language-tags';
 import { readQueryLanguage, stripQueryLanguage } from '@/utils/i18n-url';
 
@@ -179,6 +180,11 @@ export async function initI18n(): Promise<void> {
     },
     cacheUserLanguage: () => { /* writes go through explicit changeLanguage() */ },
   });
+  detector.addDetector({
+    name: 'wmVariantDefault',
+    lookup: () => SITE_VARIANT === 'signalatlas' ? 'zh' : undefined,
+    cacheUserLanguage: () => { /* variant defaults are not explicit choices */ },
+  });
 
   await i18next
     .use(detector)
@@ -194,7 +200,7 @@ export async function initI18n(): Promise<void> {
         escapeValue: false, // not needed for these simple strings
       },
       detection: {
-        order: ['wmQuery', 'wmExplicit', 'navigator'],
+        order: ['wmQuery', 'wmExplicit', 'wmVariantDefault', 'navigator'],
         caches: [], // never auto-write — only changeLanguage() persists
       },
     });

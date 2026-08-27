@@ -12,7 +12,7 @@
 // sendMediaGroup failure mode ("WEBPAGE_CURL_FAILED") does not
 // surface as a CI failure anywhere else.
 
-import { describe, it } from 'node:test';
+import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import middleware from '../middleware';
@@ -66,6 +66,53 @@ describe('middleware AI crawler variant stub', () => {
         `AI crawler stub must link the ${variant} dashboard`,
       );
     }
+  });
+});
+
+describe('middleware SignalAtlas Basic Auth', () => {
+  const originalUser = process.env.SIGNALATLAS_BASIC_AUTH_USER;
+  const originalPassword = process.env.SIGNALATLAS_BASIC_AUTH_PASSWORD;
+
+  function resetAuthEnv(): void {
+    if (originalUser === undefined) delete process.env.SIGNALATLAS_BASIC_AUTH_USER;
+    else process.env.SIGNALATLAS_BASIC_AUTH_USER = originalUser;
+    if (originalPassword === undefined) delete process.env.SIGNALATLAS_BASIC_AUTH_PASSWORD;
+    else process.env.SIGNALATLAS_BASIC_AUTH_PASSWORD = originalPassword;
+  }
+
+  function setAuthEnv(): void {
+    process.env.SIGNALATLAS_BASIC_AUTH_USER = 'atlas';
+    process.env.SIGNALATLAS_BASIC_AUTH_PASSWORD = 'hazard';
+  }
+
+  afterEach(resetAuthEnv);
+
+  it('does not challenge when credentials are not configured', () => {
+    delete process.env.SIGNALATLAS_BASIC_AUTH_USER;
+    delete process.env.SIGNALATLAS_BASIC_AUTH_PASSWORD;
+    const res = call('https://signalatlas.worldmonitor.app/dashboard', CHROME_UA);
+    assert.equal(res, undefined);
+  });
+
+  it('challenges dashboard requests when credentials are configured', () => {
+    setAuthEnv();
+    const res = call('https://signalatlas.worldmonitor.app/dashboard', CHROME_UA);
+    assert.ok(res instanceof Response);
+    assert.equal(res.status, 401);
+    assert.equal(res.headers.get('www-authenticate'), 'Basic realm="SignalAtlas", charset="UTF-8"');
+  });
+
+  it('passes dashboard requests with matching Basic credentials', () => {
+    setAuthEnv();
+    const token = Buffer.from('atlas:hazard').toString('base64');
+    const res = call('https://signalatlas.worldmonitor.app/dashboard', CHROME_UA, { authorization: `Basic ${token}` });
+    assert.equal(res, undefined);
+  });
+
+  it('lets the cron endpoint reach its own Bearer auth gate', () => {
+    setAuthEnv();
+    const res = call('https://signalatlas.worldmonitor.app/api/cron/signalatlas-seed', GENERIC_CURL_UA);
+    assert.equal(res, undefined);
   });
 });
 

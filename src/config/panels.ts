@@ -1139,10 +1139,100 @@ const ENERGY_MOBILE_MAP_LAYERS: MapLayers = {
 };
 
 // ============================================
+// SIGNALATLAS variant — signalatlas.worldmonitor.app
+// Disaster, wildfire, outage news, and AI summaries.
+// ============================================
+const SIGNALATLAS_PANELS: Record<string, PanelConfig> = {
+  map: { name: 'SignalAtlas Map', enabled: true, priority: 1 },
+  'disaster-news': { name: 'Disaster News', enabled: true, priority: 1 },
+  'outage-news': { name: 'Power & Internet Outage News', enabled: true, priority: 1 },
+  insights: { name: 'AI Disaster Insights', enabled: true, priority: 1 },
+  forecast: { name: 'AI Risk Forecasts', enabled: true, priority: 1 },
+  'threat-timeline': { name: 'Disaster Timeline', enabled: true, priority: 1 },
+  'disaster-correlation': { name: 'Disaster Cascade', enabled: true, priority: 1 },
+  'internet-disruptions': { name: 'Internet Disruptions', enabled: true, priority: 1 },
+  'satellite-fires': { name: 'Wildfire Intelligence', enabled: true, priority: 1 },
+  climate: { name: 'Climate Anomalies', enabled: true, priority: 2 },
+  'climate-news': { name: 'Climate & Disaster News', enabled: true, priority: 2 },
+  'security-advisories': { name: 'Safety Advisories', enabled: true, priority: 2 },
+  'world-clock': { name: 'World Clock', enabled: true, priority: 3 },
+};
+
+const SIGNALATLAS_MAP_LAYERS: MapLayers = {
+  gpsJamming: false,
+  satellites: false,
+  conflicts: false,
+  bases: false,
+  cables: false,
+  pipelines: false,
+  hotspots: false,
+  ais: false,
+  nuclear: false,
+  irradiators: false,
+  radiationWatch: false,
+  sanctions: false,
+  weather: true,
+  canadaRoads: false,
+  canadaAlerts: true,
+  economic: false,
+  waterways: false,
+  outages: true,
+  cyberThreats: false,
+  datacenters: false,
+  protests: false,
+  flights: false,
+  military: false,
+  natural: true,
+  spaceports: false,
+  minerals: false,
+  fires: true,
+  ucdpEvents: false,
+  displacement: false,
+  climate: true,
+  startupHubs: false,
+  cloudRegions: false,
+  accelerators: false,
+  techHQs: false,
+  techEvents: false,
+  stockExchanges: false,
+  financialCenters: false,
+  centralBanks: false,
+  commodityHubs: false,
+  gulfInvestments: false,
+  positiveEvents: false,
+  kindness: false,
+  happiness: false,
+  speciesRecovery: false,
+  renewableInstallations: false,
+  tradeRoutes: false,
+  iranAttacks: false,
+  ciiChoropleth: false,
+  resilienceScore: false,
+  dayNight: false,
+  miningSites: false,
+  processingPlants: false,
+  commodityPorts: false,
+  webcams: false,
+  diseaseOutbreaks: true,
+  storageFacilities: false,
+  fuelShortages: false,
+  liveTankers: false,
+};
+
+const SIGNALATLAS_MOBILE_MAP_LAYERS: MapLayers = {
+  ...SIGNALATLAS_MAP_LAYERS,
+  weather: false,
+  canadaAlerts: false,
+  fires: false,
+  climate: false,
+  diseaseOutbreaks: false,
+};
+
+// ============================================
 // UNIFIED PANEL REGISTRY
 // ============================================
 
-type PanelVariant = 'full' | 'tech' | 'finance' | 'commodity' | 'energy' | 'happy';
+type PanelVariant = 'full' | 'tech' | 'finance' | 'commodity' | 'energy' | 'happy' | 'signalatlas';
 
 const VARIANT_PANEL_CONFIGS: Record<PanelVariant, Record<string, PanelConfig>> = {
   full: FULL_PANELS,
@@ -1151,6 +1241,7 @@ const VARIANT_PANEL_CONFIGS: Record<PanelVariant, Record<string, PanelConfig>> =
   commodity: COMMODITY_PANELS,
   energy: ENERGY_PANELS,
   happy: HAPPY_PANELS,
+  signalatlas: SIGNALATLAS_PANELS,
 };
 
 function getVariantPanelConfigs(variant: string): Record<string, PanelConfig> | undefined {
@@ -1164,6 +1255,7 @@ export const ALL_PANELS: Record<string, PanelConfig> = {
   ...HAPPY_PANELS,
   ...COMMODITY_PANELS,
   ...ENERGY_PANELS,
+  ...SIGNALATLAS_PANELS,
   ...TECH_PANELS,
   ...FINANCE_PANELS,
   ...FULL_PANELS,
@@ -1177,6 +1269,7 @@ export const VARIANT_DEFAULTS: Record<string, string[]> = {
   commodity: Object.keys(VARIANT_PANEL_CONFIGS.commodity),
   energy:    Object.keys(VARIANT_PANEL_CONFIGS.energy),
   happy:     Object.keys(VARIANT_PANEL_CONFIGS.happy),
+  signalatlas: Object.keys(VARIANT_PANEL_CONFIGS.signalatlas),
 };
 
 /**
@@ -1203,6 +1296,13 @@ export const VARIANT_PANEL_OVERRIDES: Partial<Record<string, Partial<Record<stri
     map:         { name: 'Energy Atlas Map' },
     'live-news': { name: 'Energy Headlines' },
     insights:    { name: 'AI Energy Insights' },
+  },
+  signalatlas: {
+    map:         { name: 'SignalAtlas Map' },
+    'disaster-news': { name: 'Disaster News' },
+    'outage-news': { name: 'Power & Internet Outage News' },
+    insights:    { name: 'AI Disaster Insights' },
+    forecast:    { name: 'AI Risk Forecasts' },
   },
   happy: {
     map:         { name: 'World Map' },
@@ -1452,7 +1552,9 @@ export const DEFAULT_MAP_LAYERS = SITE_VARIANT === 'happy'
         ? COMMODITY_MAP_LAYERS
         : SITE_VARIANT === 'energy'
           ? ENERGY_MAP_LAYERS
-          : FULL_MAP_LAYERS;
+          : SITE_VARIANT === 'signalatlas'
+            ? SIGNALATLAS_MAP_LAYERS
+            : FULL_MAP_LAYERS;
 
 export const MOBILE_DEFAULT_MAP_LAYERS = SITE_VARIANT === 'happy'
   ? HAPPY_MOBILE_MAP_LAYERS
@@ -1464,7 +1566,9 @@ export const MOBILE_DEFAULT_MAP_LAYERS = SITE_VARIANT === 'happy'
         ? COMMODITY_MOBILE_MAP_LAYERS
         : SITE_VARIANT === 'energy'
           ? ENERGY_MOBILE_MAP_LAYERS
-          : FULL_MOBILE_MAP_LAYERS;
+          : SITE_VARIANT === 'signalatlas'
+            ? SIGNALATLAS_MOBILE_MAP_LAYERS
+            : FULL_MOBILE_MAP_LAYERS;
 
 /** Maps map-layer toggle keys to their data-freshness source IDs (single source of truth). */
 export const LAYER_TO_SOURCE: Partial<Record<keyof MapLayers, DataSourceId[]>> = {
@@ -1526,6 +1630,11 @@ export const PANEL_CATEGORY_MAP: Record<string, { labelKey: string; panelKeys: s
     labelKey: 'header.panelCatDataTracking',
     panelKeys: ['monitors', 'satellite-fires', 'ucdp-events', 'displacement', 'climate', 'climate-news', 'population-exposure', 'security-advisories', 'radiation-watch', 'oref-sirens', 'world-clock', 'tech-readiness', 'disease-outbreaks', 'fao-food-price-index', 'grocery-basket', 'defense-patents'],
     variants: ['full', 'energy'],
+  },
+  signalatlasSignals: {
+    labelKey: 'header.panelCatDataTracking',
+    panelKeys: ['disaster-news', 'outage-news', 'disaster-correlation', 'internet-disruptions', 'satellite-fires', 'climate', 'climate-news', 'security-advisories', 'world-clock'],
+    variants: ['signalatlas'],
   },
 
   // Tech variant

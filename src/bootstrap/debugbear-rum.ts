@@ -15,6 +15,7 @@ export const DEBUGBEAR_RUM_HOSTS = new Set([
   'commodity.worldmonitor.app',
   'happy.worldmonitor.app',
   'energy.worldmonitor.app',
+  'signalatlas.worldmonitor.app',
 ]);
 
 import type { BootstrapR2RumSample } from './bootstrap-r2-rum';

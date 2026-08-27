@@ -43,6 +43,7 @@ const PUBLIC_API_PATHS = new Set([
   '/api/health',
   '/api/seed-contract-probe',
   '/api/internal/brief-why-matters',
+  '/api/cron/signalatlas-seed',
   '/api/llms.txt',
   '/api/product-catalog',
 ]);
@@ -66,6 +67,7 @@ const VARIANT_HOST_MAP: Record<string, string> = {
   'commodity.worldmonitor.app': 'commodity',
   'happy.worldmonitor.app': 'happy',
   'energy.worldmonitor.app': 'energy',
+  'signalatlas.worldmonitor.app': 'signalatlas',
 };
 
 // Source of truth: src/config/variant-meta.ts — keep in sync when variant metadata changes.
@@ -108,6 +110,13 @@ const VARIANT_OG: Record<string, { name: string; title: string; description: str
     image: 'https://energy.worldmonitor.app/favico/energy/og-image.png',
     url: 'https://energy.worldmonitor.app/dashboard',
   },
+  signalatlas: {
+    name: 'SignalAtlas',
+    title: 'SignalAtlas - Global Disaster and Outage Monitor',
+    description: 'SignalAtlas tracks earthquakes, natural disasters, wildfires, internet disruptions, disaster headlines, outage news, and AI summaries in a focused public dashboard.',
+    image: 'https://signalatlas.worldmonitor.app/favico/signalatlas/og-image.png',
+    url: 'https://signalatlas.worldmonitor.app/dashboard',
+  },
 };
 
 const ALLOWED_HOSTS = new Set([
@@ -122,6 +131,59 @@ function normalizeHost(raw: string): string {
 
 function isAllowedHost(host: string): boolean {
   return ALLOWED_HOSTS.has(host) || VERCEL_PREVIEW_RE.test(host);
+}
+
+function isSignalAtlasCronBypass(path: string): boolean {
+  return path === '/api/cron/signalatlas-seed' || path === '/api/cron/signalatlas-seed/';
+}
+
+function unauthorizedBasicAuthResponse(): Response {
+  return new Response('Authentication required', {
+    status: 401,
+    headers: {
+      'WWW-Authenticate': 'Basic realm="SignalAtlas", charset="UTF-8"',
+      'Cache-Control': 'no-store',
+    },
+  });
+}
+
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+function decodeBasicCredentials(authHeader: string | null): { user: string; pass: string } | null {
+  if (!authHeader?.startsWith('Basic ')) return null;
+  try {
+    const decoded = atob(authHeader.slice('Basic '.length));
+    const separator = decoded.indexOf(':');
+    if (separator < 0) return null;
+    return {
+      user: decoded.slice(0, separator),
+      pass: decoded.slice(separator + 1),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function requireSignalAtlasBasicAuth(request: Request, path: string): Response | undefined {
+  const expectedUser = process.env.SIGNALATLAS_BASIC_AUTH_USER;
+  const expectedPassword = process.env.SIGNALATLAS_BASIC_AUTH_PASSWORD;
+  if (!expectedUser || !expectedPassword) return undefined;
+  if (request.method === 'OPTIONS' || isSignalAtlasCronBypass(path)) return undefined;
+
+  const credentials = decodeBasicCredentials(request.headers.get('authorization'));
+  if (
+    !credentials ||
+    !constantTimeEqual(credentials.user, expectedUser) ||
+    !constantTimeEqual(credentials.pass, expectedPassword)
+  ) {
+    return unauthorizedBasicAuthResponse();
+  }
+  return undefined;
 }
 
 function hasLegacyDashboardRootState(searchParams: URLSearchParams): boolean {
@@ -168,6 +230,9 @@ export default function middleware(request: Request) {
   const ua = request.headers.get('user-agent') ?? '';
   const path = url.pathname;
   const host = normalizeHost(request.headers.get('host') ?? url.hostname);
+
+  const authResponse = requireSignalAtlasBasicAuth(request, path);
+  if (authResponse) return authResponse;
 
   if (path === '/' && hasLegacyDashboardRootState(url.searchParams)) {
     const dashboardUrl = new URL(request.url);

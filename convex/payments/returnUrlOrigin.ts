@@ -27,6 +27,7 @@ export const TRUSTED_RETURN_URL_ORIGINS: readonly string[] = [
   "https://commodity.worldmonitor.app",
   "https://happy.worldmonitor.app",
   "https://energy.worldmonitor.app",
+  "https://signalatlas.worldmonitor.app",
 ];
 
 /**

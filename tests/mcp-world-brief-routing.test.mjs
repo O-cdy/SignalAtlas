@@ -34,6 +34,7 @@ const HOSTS = [
   { url: 'https://commodity.worldmonitor.app/mcp', hostClass: 'variant' },
   { url: 'https://happy.worldmonitor.app/mcp', hostClass: 'variant' },
   { url: 'https://energy.worldmonitor.app/mcp', hostClass: 'variant' },
+  { url: 'https://signalatlas.worldmonitor.app/mcp', hostClass: 'variant' },
 ];
 
 const AUTH_CASES = [

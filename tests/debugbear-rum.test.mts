@@ -238,6 +238,7 @@ describe('DebugBear RUM marketing loader', () => {
       'commodity.worldmonitor.app',
       'happy.worldmonitor.app',
       'energy.worldmonitor.app',
+      'signalatlas.worldmonitor.app',
       'localhost',
       'worldmonitor-git-codex-preview-eliewm.vercel.app',
       'evilworldmonitor.app',

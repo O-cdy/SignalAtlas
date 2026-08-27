@@ -16,6 +16,7 @@ const EXPECTED_PAGE_HOSTS = new Set([
   'commodity.worldmonitor.app',
   'happy.worldmonitor.app',
   'energy.worldmonitor.app',
+  'signalatlas.worldmonitor.app',
 ]);
 
 const decodeXml = (value) => String(value)

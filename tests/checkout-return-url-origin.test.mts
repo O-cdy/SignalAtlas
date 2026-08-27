@@ -34,6 +34,7 @@ describe('checkout returnUrl origin allowlist', () => {
       'https://commodity.worldmonitor.app',
       'https://happy.worldmonitor.app',
       'https://energy.worldmonitor.app',
+      'https://signalatlas.worldmonitor.app',
     ]) {
       assert.equal(isTrustedReturnUrlOrigin(origin), true, `expected trusted: ${origin}`);
     }

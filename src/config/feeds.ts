@@ -1078,6 +1078,25 @@ const ENERGY_FEEDS: Record<string, Feed[]> = {
   ],
 };
 
+// SignalAtlas variant feeds — focused on disaster, wildfire, and outage signals.
+const SIGNALATLAS_FEEDS: Record<string, Feed[]> = {
+  'disaster-news': [
+    { name: 'ReliefWeb Disasters', url: rss('https://reliefweb.int/disasters/rss.xml') },
+    { name: 'GDACS Alerts', url: rss('https://www.gdacs.org/xml/rss.xml') },
+    { name: 'NASA Earth Observatory', url: rss('https://earthobservatory.nasa.gov/feeds/earth-observatory.rss') },
+    { name: 'Guardian Environment', url: rss('https://www.theguardian.com/environment/rss') },
+    { name: 'Disaster News', url: rss('https://news.google.com/rss/search?q=(earthquake+OR+flood+OR+wildfire+OR+hurricane+OR+typhoon+OR+volcano+OR+landslide)+"natural+disaster"+when:1d&hl=en-US&gl=US&ceid=US:en') },
+    { name: 'Humanitarian Alerts', url: rss('https://news.google.com/rss/search?q=(ReliefWeb+OR+OCHA+OR+IFRC)+(flood+OR+earthquake+OR+wildfire+OR+cyclone)+when:2d&hl=en-US&gl=US&ceid=US:en') },
+  ],
+  'outage-news': [
+    { name: 'Power Outage News', url: rss('https://news.google.com/rss/search?q=("power+outage"+OR+blackout+OR+"grid+failure"+OR+"electricity+outage")+when:1d&hl=en-US&gl=US&ceid=US:en') },
+    { name: 'Infrastructure Disruptions', url: rss('https://news.google.com/rss/search?q=("infrastructure+disruption"+OR+"utility+outage"+OR+"water+outage"+OR+"telecom+outage")+when:1d&hl=en-US&gl=US&ceid=US:en') },
+    { name: 'Internet Outage News', url: rss('https://news.google.com/rss/search?q=("internet+outage"+OR+"network+outage"+OR+"Cloudflare+Radar"+OR+NetBlocks)+when:1d&hl=en-US&gl=US&ceid=US:en') },
+    { name: 'Cloud Outages', url: rss('https://news.google.com/rss/search?q=(AWS+OR+Azure+OR+"Google+Cloud"+OR+Cloudflare+OR+GitHub+OR+Slack)+(outage+OR+down)+when:1d&hl=en-US&gl=US&ceid=US:en') },
+  ],
+  crisis: FULL_FEEDS.crisis ?? [],
+};
+
 // Variant-aware exports
 export const FEEDS = SITE_VARIANT === 'tech'
   ? TECH_FEEDS
@@ -1089,7 +1108,9 @@ export const FEEDS = SITE_VARIANT === 'tech'
         ? COMMODITY_FEEDS
         : SITE_VARIANT === 'energy'
           ? ENERGY_FEEDS
-          : FULL_FEEDS;
+          : SITE_VARIANT === 'signalatlas'
+            ? SIGNALATLAS_FEEDS
+            : FULL_FEEDS;
 
 // Canonical category→feeds map: the union of every variant's feed set.
 // `FEEDS` (above) is just the active variant's PRESET; users freely customize
@@ -1104,6 +1125,7 @@ export const CANONICAL_FEEDS: Record<string, Feed[]> = mergeCanonicalFeeds([
   FINANCE_FEEDS,
   COMMODITY_FEEDS,
   ENERGY_FEEDS,
+  SIGNALATLAS_FEEDS,
   HAPPY_FEEDS,
 ]);
 
@@ -1128,6 +1150,10 @@ export const SOURCE_REGION_MAP: Record<string, { labelKey: string; feedKeys: str
   cybersecurity: { labelKey: 'header.sourceRegionCybersecurity', feedKeys: ['security'] },
   techPolicy: { labelKey: 'header.sourceRegionTechPolicy', feedKeys: ['policy', 'thinktanks'] },
   techMedia: { labelKey: 'header.sourceRegionTechMedia', feedKeys: ['podcasts', 'layoffs', 'finance'] },
+
+  // SignalAtlas variant regions
+  signalatlasDisasters: { labelKey: 'header.sourceRegionWorldwide', feedKeys: ['disaster-news', 'crisis'] },
+  signalatlasOutages: { labelKey: 'header.sourceRegionDeveloper', feedKeys: ['outage-news'] },
 
   // Finance variant regions
   marketsAnalysis: { labelKey: 'header.sourceRegionMarkets', feedKeys: ['markets', 'analysis', 'ipo'] },
@@ -1588,6 +1614,8 @@ asia: ['BBC Asia', 'The Diplomat', 'South China Morning Post', 'Reuters Asia', '
   thinktanks: ['Foreign Policy', 'Atlantic Council', 'Foreign Affairs', 'CSIS', 'RAND', 'Brookings', 'Carnegie', 'War on the Rocks', 'ISW'],
   crisis: ['CrisisWatch', 'IAEA', 'WHO', 'UNHCR'],
   energy: ['Oil & Gas', 'Nuclear Energy', 'Reuters Energy', 'Mining & Resources'],
+  'disaster-news': ['ReliefWeb Disasters', 'GDACS Alerts', 'NASA Earth Observatory', 'Disaster News'],
+  'outage-news': ['Power Outage News', 'Infrastructure Disruptions', 'Internet Outage News', 'Cloud Outages'],
 };
 
 export const DEFAULT_ENABLED_INTEL: string[] = [

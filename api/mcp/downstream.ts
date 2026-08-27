@@ -14,6 +14,7 @@ const VARIANT_HOSTS: ReadonlySet<string> = new Set([
   'commodity.worldmonitor.app',
   'happy.worldmonitor.app',
   'energy.worldmonitor.app',
+  'signalatlas.worldmonitor.app',
 ]);
 
 const SAFE_GATEWAY_ERROR_CODES: ReadonlySet<string> = new Set([

@@ -12,6 +12,7 @@ export const DEBUGBEAR_RUM_HOSTS = new Set([
   'commodity.worldmonitor.app',
   'happy.worldmonitor.app',
   'energy.worldmonitor.app',
+  'signalatlas.worldmonitor.app',
 ]);
 
 type DebugBearRumEvent = ['presampling', number] | ['error' | 'unhandledrejection', Event];

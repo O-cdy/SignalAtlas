@@ -100,6 +100,10 @@ export const STATIC_ROUTE_MANIFEST = Object.freeze([
     ...DASHBOARD_MATERIAL_SOURCES,
     'src/config/variants/energy.ts',
   ]),
+  route('https://signalatlas.worldmonitor.app/dashboard', 'dashboard-variant', [
+    ...DASHBOARD_MATERIAL_SOURCES,
+    'src/config/variants/signalatlas.ts',
+  ]),
 ]);
 
 const STATIC_LOCATIONS = new Set(STATIC_ROUTE_MANIFEST.map((entry) => entry.loc));

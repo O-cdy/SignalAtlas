@@ -736,6 +736,29 @@ export const VARIANT_FEEDS: Record<string, Record<string, ServerFeed[]>> = {
       { name: 'Shareable', url: 'https://www.shareable.net/feed/' },
     ],
   },
+
+  signalatlas: {
+    'disaster-news': [
+      { name: 'ReliefWeb Disasters', url: 'https://reliefweb.int/disasters/rss.xml' },
+      { name: 'GDACS Alerts', url: 'https://www.gdacs.org/xml/rss.xml' },
+      { name: 'NASA Earth Observatory', url: 'https://earthobservatory.nasa.gov/feeds/earth-observatory.rss' },
+      { name: 'Guardian Environment', url: 'https://www.theguardian.com/environment/rss' },
+      { name: 'Disaster News', url: gn('(earthquake OR flood OR wildfire OR hurricane OR typhoon OR volcano OR landslide) "natural disaster" when:1d') },
+      { name: 'Humanitarian Alerts', url: gn('(ReliefWeb OR OCHA OR IFRC) (flood OR earthquake OR wildfire OR cyclone) when:2d') },
+    ],
+    'outage-news': [
+      { name: 'Power Outage News', url: gn('"power outage" OR blackout OR "grid failure" OR "electricity outage" when:1d') },
+      { name: 'Infrastructure Disruptions', url: gn('"infrastructure disruption" OR "utility outage" OR "water outage" OR "telecom outage" when:1d') },
+      { name: 'Internet Outage News', url: gn('"internet outage" OR "network outage" OR "Cloudflare Radar" OR NetBlocks when:1d') },
+      { name: 'Cloud Outages', url: gn('(AWS OR Azure OR "Google Cloud" OR Cloudflare OR GitHub OR Slack) (outage OR down) when:1d') },
+    ],
+    crisis: [
+      { name: 'CrisisWatch', url: 'https://www.crisisgroup.org/rss' },
+      { name: 'IAEA', url: 'https://www.iaea.org/feeds/topnews' },
+      { name: 'WHO', url: 'https://www.who.int/rss-feeds/news-english.xml' },
+      { name: 'UNHCR', url: 'https://www.unhcr.org/rss/news-releases' },
+    ],
+  },
 };
 
 export const INTEL_SOURCES: ServerFeed[] = [

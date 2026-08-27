@@ -18,3 +18,4 @@
 - Deployment target: Vercel + Upstash Redis with 15-minute Vercel Cron seeding and no-key degradation states.
 - Deployment trigger refreshed at `2026-08-27T08:40:00Z` after the GitHub repository was made public.
 - Deployment trigger refreshed at `2026-08-27T08:51:20Z` after reconnecting the Vercel GitHub integration.
+- Fixed `scripts/vercel-ignore.sh` at `2026-08-27T08:54:00Z` so the first `main` production deployment builds when Vercel has no previous production SHA.

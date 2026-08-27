@@ -370,6 +370,34 @@ describe('crawlable content corpus deployment contracts', () => {
     }
   });
 
+  it('builds Vercel on the first main deployment when no previous production SHA exists', () => {
+    const fixture = mkdtempSync(join(tmpdir(), 'wm-vercel-first-main-'));
+    try {
+      const fixtureEnv = { ...process.env };
+      for (const key of ['GIT_COMMON_DIR', 'GIT_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_WORK_TREE']) {
+        delete fixtureEnv[key];
+      }
+      const git = (...args) => execFileSync('git', args, { cwd: fixture, env: fixtureEnv, encoding: 'utf8' });
+      git('init', '-q');
+      git('config', 'user.email', 'test@example.com');
+      git('config', 'user.name', 'Test');
+      writeFileSync(join(fixture, 'README.md'), 'base\n');
+      git('add', 'README.md');
+      git('commit', '-qm', 'base');
+
+      assert.throws(
+        () => execFileSync('/bin/bash', [resolve(__dirname, '../scripts/vercel-ignore.sh')], {
+          cwd: fixture,
+          env: { ...fixtureEnv, VERCEL_GIT_COMMIT_REF: 'main', VERCEL_GIT_PREVIOUS_SHA: '' },
+        }),
+        (error) => error?.status === 1,
+        'first production deployment on main must request a Vercel build',
+      );
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
   it('builds Vercel on main and preview for generated web-input changes', () => {
     const fixture = mkdtempSync(join(tmpdir(), 'wm-vercel-ignore-'));
     try {

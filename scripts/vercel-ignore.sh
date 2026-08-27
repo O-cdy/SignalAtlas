@@ -21,6 +21,14 @@ if [ "$VERCEL_GIT_COMMIT_REF" = "main" ] && [ -n "$VERCEL_GIT_PREVIOUS_SHA" ]; t
   exit 1
 fi
 
+# First production deployment after connecting a Vercel project may not have a
+# previous production SHA. Build instead of falling through to the branch
+# merge-base path, where origin/main can equal HEAD and make the diff look empty.
+if [ "$VERCEL_GIT_COMMIT_REF" = "main" ] && [ -z "$VERCEL_GIT_PREVIOUS_SHA" ]; then
+  echo "Building: main deployment has no previous SHA"
+  exit 1
+fi
+
 # Resolve comparison base: prefer `merge-base HEAD origin/main` (the SHA
 # where this branch left main), fall back to VERCEL_GIT_PREVIOUS_SHA.
 #

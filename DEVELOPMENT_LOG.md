@@ -26,3 +26,4 @@
 - Fixed duplicate Basic Auth prompts at `2026-08-28T06:45:00Z` by limiting browser challenges to document requests, returning non-challenging JSON 401s for API requests, and allowing static assets through.
 - Released API reads from the Basic Auth gate at `2026-08-28T06:56:00Z` so same-origin news and disaster RPC calls can load data after the page-level login succeeds.
 - Fixed SignalAtlas Hobby `.vercelignore` dynamic API route unignore rules at `2026-08-28T09:48:00Z`; `[rpc].ts` path patterns were treated as character classes, causing disaster/news RPC endpoints to deploy as 404.
+- Added `.vercelignore` to `scripts/vercel-ignore.sh` web-relevant paths at `2026-08-28T09:50:00Z` so function-scope fixes trigger Vercel builds.

@@ -109,13 +109,10 @@ describe('middleware SignalAtlas Basic Auth', () => {
     assert.equal(res, undefined);
   });
 
-  it('returns API auth failures without a browser Basic challenge', () => {
+  it('does not put Basic Auth in front of same-origin API reads', () => {
     setAuthEnv();
     const res = call('https://signalatlas.worldmonitor.app/api/news/v1/list-feed-digest', CHROME_UA);
-    assert.ok(res instanceof Response);
-    assert.equal(res.status, 401);
-    assert.equal(res.headers.get('www-authenticate'), null);
-    assert.equal(res.headers.get('content-type'), 'application/json');
+    assert.equal(res, undefined, 'app data APIs must reach their route handlers after the page-level Basic Auth gate');
   });
 
   it('does not challenge static assets that load alongside the document', () => {

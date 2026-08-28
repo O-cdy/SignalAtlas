@@ -160,16 +160,6 @@ function unauthorizedBasicAuthResponse(): Response {
   });
 }
 
-function unauthorizedApiAuthResponse(): Response {
-  return new Response('{"error":"Authentication required"}', {
-    status: 401,
-    headers: {
-      'Content-Type': 'application/json',
-      'Cache-Control': 'no-store',
-    },
-  });
-}
-
 function constantTimeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   let diff = 0;
@@ -196,7 +186,7 @@ function requireSignalAtlasBasicAuth(request: Request, path: string): Response |
   const expectedUser = process.env.SIGNALATLAS_BASIC_AUTH_USER;
   const expectedPassword = process.env.SIGNALATLAS_BASIC_AUTH_PASSWORD;
   if (!expectedUser || !expectedPassword) return undefined;
-  if (request.method === 'OPTIONS' || isSignalAtlasCronBypass(path)) return undefined;
+  if (request.method === 'OPTIONS' || isSignalAtlasCronBypass(path) || path.startsWith('/api/')) return undefined;
   if (isStaticAssetPath(path)) return undefined;
 
   const credentials = decodeBasicCredentials(request.headers.get('authorization'));
@@ -205,7 +195,6 @@ function requireSignalAtlasBasicAuth(request: Request, path: string): Response |
     !constantTimeEqual(credentials.user, expectedUser) ||
     !constantTimeEqual(credentials.pass, expectedPassword)
   ) {
-    if (path.startsWith('/api/')) return unauthorizedApiAuthResponse();
     return unauthorizedBasicAuthResponse();
   }
   return undefined;

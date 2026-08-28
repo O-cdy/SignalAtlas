@@ -21,3 +21,5 @@
 - Fixed `scripts/vercel-ignore.sh` at `2026-08-27T08:54:00Z` so the first `main` production deployment builds when Vercel has no previous production SHA.
 - Temporarily changed Vercel Cron to daily at `2026-08-27T09:13:00Z` because Hobby accounts reject `*/15 * * * *`; restore the 15-minute schedule after upgrading to Pro.
 - Scoped `.vercelignore` at `2026-08-27T09:20:00Z` so Hobby deployments keep only the SignalAtlas API functions and stay below Vercel's 12-function limit.
+- Fixed Vercel default-domain variant detection at `2026-08-28T06:35:00Z`; unknown production hosts now honor `VITE_VARIANT=signalatlas` instead of falling back to `full`.
+- Verified `listFeedDigest({ variant: 'signalatlas' })` returns disaster and outage news categories locally (`disaster-news=20`, `outage-news=20`).

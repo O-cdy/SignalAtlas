@@ -137,11 +137,34 @@ function isSignalAtlasCronBypass(path: string): boolean {
   return path === '/api/cron/signalatlas-seed' || path === '/api/cron/signalatlas-seed/';
 }
 
+function isStaticAssetPath(path: string): boolean {
+  return (
+    path.startsWith('/assets/') ||
+    path.startsWith('/favico/') ||
+    path.startsWith('/map-styles/') ||
+    path.startsWith('/textures/') ||
+    path === '/manifest.webmanifest' ||
+    path === '/offline.html' ||
+    path === '/sw.js' ||
+    /^\/workbox-[a-f0-9]+\.js$/.test(path)
+  );
+}
+
 function unauthorizedBasicAuthResponse(): Response {
   return new Response('Authentication required', {
     status: 401,
     headers: {
       'WWW-Authenticate': 'Basic realm="SignalAtlas", charset="UTF-8"',
+      'Cache-Control': 'no-store',
+    },
+  });
+}
+
+function unauthorizedApiAuthResponse(): Response {
+  return new Response('{"error":"Authentication required"}', {
+    status: 401,
+    headers: {
+      'Content-Type': 'application/json',
       'Cache-Control': 'no-store',
     },
   });
@@ -174,6 +197,7 @@ function requireSignalAtlasBasicAuth(request: Request, path: string): Response |
   const expectedPassword = process.env.SIGNALATLAS_BASIC_AUTH_PASSWORD;
   if (!expectedUser || !expectedPassword) return undefined;
   if (request.method === 'OPTIONS' || isSignalAtlasCronBypass(path)) return undefined;
+  if (isStaticAssetPath(path)) return undefined;
 
   const credentials = decodeBasicCredentials(request.headers.get('authorization'));
   if (
@@ -181,6 +205,7 @@ function requireSignalAtlasBasicAuth(request: Request, path: string): Response |
     !constantTimeEqual(credentials.user, expectedUser) ||
     !constantTimeEqual(credentials.pass, expectedPassword)
   ) {
+    if (path.startsWith('/api/')) return unauthorizedApiAuthResponse();
     return unauthorizedBasicAuthResponse();
   }
   return undefined;

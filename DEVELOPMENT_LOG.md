@@ -23,3 +23,4 @@
 - Scoped `.vercelignore` at `2026-08-27T09:20:00Z` so Hobby deployments keep only the SignalAtlas API functions and stay below Vercel's 12-function limit.
 - Fixed Vercel default-domain variant detection at `2026-08-28T06:35:00Z`; unknown production hosts now honor `VITE_VARIANT=signalatlas` instead of falling back to `full`.
 - Verified `listFeedDigest({ variant: 'signalatlas' })` returns disaster and outage news categories locally (`disaster-news=20`, `outage-news=20`).
+- Fixed duplicate Basic Auth prompts at `2026-08-28T06:45:00Z` by limiting browser challenges to document requests, returning non-challenging JSON 401s for API requests, and allowing static assets through.

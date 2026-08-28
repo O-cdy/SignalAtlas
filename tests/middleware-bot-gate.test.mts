@@ -109,6 +109,23 @@ describe('middleware SignalAtlas Basic Auth', () => {
     assert.equal(res, undefined);
   });
 
+  it('returns API auth failures without a browser Basic challenge', () => {
+    setAuthEnv();
+    const res = call('https://signalatlas.worldmonitor.app/api/news/v1/list-feed-digest', CHROME_UA);
+    assert.ok(res instanceof Response);
+    assert.equal(res.status, 401);
+    assert.equal(res.headers.get('www-authenticate'), null);
+    assert.equal(res.headers.get('content-type'), 'application/json');
+  });
+
+  it('does not challenge static assets that load alongside the document', () => {
+    setAuthEnv();
+    for (const path of ['/assets/main-test.js', '/sw.js', '/manifest.webmanifest', '/favico/og-image.png']) {
+      const res = call(`https://signalatlas.worldmonitor.app${path}`, CHROME_UA);
+      assert.equal(res, undefined, `${path} should not trigger a second Basic Auth prompt`);
+    }
+  });
+
   it('lets the cron endpoint reach its own Bearer auth gate', () => {
     setAuthEnv();
     const res = call('https://signalatlas.worldmonitor.app/api/cron/signalatlas-seed', GENERIC_CURL_UA);
